@@ -223,16 +223,18 @@ def cmd_record_action(args: argparse.Namespace) -> int:
     action = args.action.lower()
 
     if action == "applied":
-        target["status"] = "applied"
-        target["action_date"] = today
+        # Order matters: do the fallible markdown append BEFORE mutating
+        # `target` or saving JSON state. If append_application throws, we
+        # haven't half-recorded — the match stays surfaced and the user
+        # can retry cleanly.
         state.append_application(
             date=today, company=target["company"], title=target["title"],
             location=target.get("location", ""), url=target.get("url", ""),
         )
-        history = state.load_history() + [target]
-        state.save_history(history)
-        items = [m for m in items if m["id"] != args.match_id]
-        state.save_matches(items)
+        target["status"] = "applied"
+        target["action_date"] = today
+        state.save_history(state.load_history() + [target])
+        state.save_matches([m for m in items if m["id"] != args.match_id])
         print(f"recorded applied: {target['company']} — {target['title']}")
         return 0
 
@@ -240,17 +242,16 @@ def cmd_record_action(args: argparse.Namespace) -> int:
         if not args.reason:
             print("pass requires --reason TEXT", file=sys.stderr)
             return 1
-        target["status"] = "passed"
-        target["action_date"] = today
-        target["pass_reason"] = args.reason
+        # Same ordering rule as applied — fallible markdown append first.
         state.append_pass_reason(
             date=today, company=target["company"],
             location=target.get("location", ""), reason=args.reason,
         )
-        history = state.load_history() + [target]
-        state.save_history(history)
-        items = [m for m in items if m["id"] != args.match_id]
-        state.save_matches(items)
+        target["status"] = "passed"
+        target["action_date"] = today
+        target["pass_reason"] = args.reason
+        state.save_history(state.load_history() + [target])
+        state.save_matches([m for m in items if m["id"] != args.match_id])
         print(f"recorded pass: {target['company']} — {args.reason}")
         return 0
 

@@ -76,3 +76,141 @@ def test_merge_with_carryforward_preserves_unactioned_old_matches(tmp_path, monk
     # times_carried for old1 was incremented
     old = next(m for m in merged if m["id"] == "old1")
     assert old["times_carried"] == 3
+
+
+# -----------------------------------------------------------------------------
+# cmd_record_action — the action handlers
+# -----------------------------------------------------------------------------
+
+
+def _seed_match(monkeypatch, tmp_path, match_id="jm_test1234", **overrides):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    base = {
+        "id": match_id, "title": "Mech Eng", "company": "Acme",
+        "location": "Chicago, IL", "url": "https://example.com/jobs/1",
+        "salary": "$80K-$100K", "posted_date": "2026-05-12",
+        "surfaced_date": "2026-05-12", "score": {"overall": 4.0, "dims": {}},
+        "one_line_take": "fits", "status": "surfaced", "times_carried": 0,
+        **overrides,
+    }
+    state.save_matches([base])
+    return base
+
+
+class _Args:
+    """Quick stand-in for argparse.Namespace."""
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def test_cmd_record_action_applied_moves_to_history_and_appends_application(tmp_path, monkeypatch):
+    _seed_match(monkeypatch, tmp_path, match_id="jm_apply1")
+    args = _Args(match_id="jm_apply1", action="applied", reason="")
+    rc = cli.cmd_record_action(args)
+    assert rc == 0
+
+    # Match removed from active queue
+    assert state.load_matches() == []
+
+    # History gets the match with status=applied + action_date
+    history = state.load_history()
+    assert len(history) == 1
+    assert history[0]["status"] == "applied"
+    assert history[0]["action_date"]  # populated
+
+    # applications.md row exists
+    app_path = tmp_path / "projects" / "Job_Search" / "discovery" / "applications.md"
+    assert app_path.exists()
+    text = app_path.read_text(encoding="utf-8")
+    assert "Acme" in text
+    assert "Mech Eng" in text
+
+
+def test_cmd_record_action_pass_requires_reason(tmp_path, monkeypatch):
+    _seed_match(monkeypatch, tmp_path, match_id="jm_pass1")
+    args = _Args(match_id="jm_pass1", action="pass", reason="")
+    rc = cli.cmd_record_action(args)
+    assert rc == 1
+    # Match must still be active — no mutation on missing reason
+    assert len(state.load_matches()) == 1
+
+
+def test_cmd_record_action_pass_with_reason_writes_preference_and_history(tmp_path, monkeypatch):
+    _seed_match(monkeypatch, tmp_path, match_id="jm_pass2")
+    args = _Args(match_id="jm_pass2", action="pass", reason="too senior")
+    rc = cli.cmd_record_action(args)
+    assert rc == 0
+
+    assert state.load_matches() == []
+    history = state.load_history()
+    assert len(history) == 1
+    assert history[0]["status"] == "passed"
+    assert history[0]["pass_reason"] == "too senior"
+
+    pref_path = tmp_path / "projects" / "Job_Search" / "discovery" / "preferences.md"
+    assert pref_path.exists()
+    assert "too senior" in pref_path.read_text(encoding="utf-8")
+
+
+def test_cmd_record_action_tomorrow_does_not_mutate_state(tmp_path, monkeypatch):
+    seeded = _seed_match(monkeypatch, tmp_path, match_id="jm_tom1")
+    args = _Args(match_id="jm_tom1", action="tomorrow", reason="")
+    rc = cli.cmd_record_action(args)
+    assert rc == 0
+    # Match still active, unchanged
+    items = state.load_matches()
+    assert len(items) == 1
+    assert items[0]["id"] == "jm_tom1"
+    assert items[0]["status"] == "surfaced"
+    # No history written
+    assert state.load_history() == []
+
+
+def test_cmd_record_action_decoded_flips_flag_keeps_in_queue(tmp_path, monkeypatch):
+    _seed_match(monkeypatch, tmp_path, match_id="jm_dec1")
+    args = _Args(match_id="jm_dec1", action="decoded", reason="")
+    rc = cli.cmd_record_action(args)
+    assert rc == 0
+    items = state.load_matches()
+    assert len(items) == 1
+    assert items[0]["decoded"] is True
+    assert items[0]["status"] == "surfaced"  # still in queue
+    assert state.load_history() == []  # not retired
+
+
+def test_cmd_record_action_unknown_match_id_errors(tmp_path, monkeypatch):
+    _seed_match(monkeypatch, tmp_path, match_id="jm_real1")
+    args = _Args(match_id="jm_does_not_exist", action="applied", reason="")
+    rc = cli.cmd_record_action(args)
+    assert rc == 1
+    # No mutation
+    assert len(state.load_matches()) == 1
+    assert state.load_history() == []
+
+
+def test_cmd_record_action_applied_failure_in_append_does_not_corrupt_state(
+    tmp_path, monkeypatch,
+):
+    """Regression: if append_application throws after we've already mutated
+    the in-memory match dict, the match must NOT have been retired from
+    job_matches.json. Order: fallible append first, then state mutations.
+    """
+    _seed_match(monkeypatch, tmp_path, match_id="jm_fail1")
+
+    def boom(**_kw):
+        raise IOError("disk full")
+
+    monkeypatch.setattr(state, "append_application", boom)
+
+    args = _Args(match_id="jm_fail1", action="applied", reason="")
+    with pytest.raises(IOError, match="disk full"):
+        cli.cmd_record_action(args)
+
+    # Match must still be active (not yet moved to history) AND not mutated
+    items = state.load_matches()
+    assert len(items) == 1
+    assert items[0]["id"] == "jm_fail1"
+    assert items[0]["status"] == "surfaced"  # NOT "applied"
+    assert "action_date" not in items[0]
+    assert state.load_history() == []
