@@ -130,3 +130,93 @@ def test_fetch_all_isolates_per_pair_failures(monkeypatch):
     # 4 successful boards, 1 listing each, all dedupe to 1 (same company+title+location)
     assert len(listings) == 1
     assert listings[0]["source"] == "linkedin"  # quality winner
+
+
+def test_normalize_listing_handles_nan_salary():
+    """Bug B: JobSpy returns NaN (not None) for missing salary fields when
+    serializing pandas DataFrames. int(NaN) raises ValueError.
+    """
+    nan = float("nan")
+    raw = {
+        "title": "Mech Eng", "company": "Acme", "location": "Chicago, IL",
+        "job_url": "https://example.com/1", "site": "indeed",
+        "min_amount": nan, "max_amount": nan, "date_posted": "2026-05-12",
+    }
+    out = search.normalize_listing(raw)  # Must not raise
+    assert out["salary"] == ""
+
+
+def test_normalize_listing_handles_partial_nan_salary():
+    """Min set, max NaN — should still produce '+'-style salary."""
+    nan = float("nan")
+    raw = {
+        "title": "T", "company": "C", "location": "L",
+        "job_url": "u", "site": "indeed",
+        "min_amount": 75000, "max_amount": nan,
+    }
+    out = search.normalize_listing(raw)
+    assert out["salary"] == "$75K+"
+
+
+def test_fetch_all_isolates_bad_listing_within_a_board(monkeypatch):
+    """Bug B: a single bad listing in a DataFrame must not kill the whole
+    board's batch. A NaN salary in row 1 should not drop rows 0 and 2.
+    Regression: prior impl let normalize_listing's ValueError propagate up
+    to the per-board try/except, dropping the entire DataFrame.
+    """
+    nan = float("nan")
+
+    def fake_scrape_jobs(**kwargs):
+        if kwargs["site_name"][0] == "indeed":
+            return pd.DataFrame([
+                {"title": "Good Eng A", "company": "A", "location": "Chicago, IL",
+                 "job_url": "u1", "site": "indeed", "min_amount": 70000, "max_amount": 90000},
+                {"title": "Bad Eng", "company": "B", "location": "Chicago, IL",
+                 "job_url": "u2", "site": "indeed", "min_amount": nan, "max_amount": nan},
+                {"title": "Good Eng C", "company": "C", "location": "Chicago, IL",
+                 "job_url": "u3", "site": "indeed", "min_amount": 80000, "max_amount": 100000},
+            ])
+        return pd.DataFrame()
+
+    import jobspy
+    monkeypatch.setattr(jobspy, "scrape_jobs", fake_scrape_jobs)
+
+    listings, status = search.fetch_all(
+        {"roles": ["Eng"], "locations": ["Chicago, IL"]},
+        results_per_board=20,
+    )
+
+    # All 3 indeed listings made it (the "bad" one with NaN gets salary="")
+    indeed_listings = [l for l in listings if l["source"] == "indeed"]
+    assert len(indeed_listings) == 3
+    assert status["indeed@Chicago, IL"] == "ok"
+
+
+def test_fetch_all_excludes_title_exclusions_from_search_terms(monkeypatch):
+    """Bug A: criteria.title_exclusions must NOT be sent as search terms to
+    JobSpy. Regression guard: earlier impl folded exclusions into roles, so
+    the search query said `"Mech Eng" OR "Senior" OR "Manager"`.
+    """
+    captured_terms = []
+
+    def fake_scrape_jobs(**kwargs):
+        captured_terms.append(kwargs.get("search_term"))
+        return pd.DataFrame()
+
+    import jobspy
+    monkeypatch.setattr(jobspy, "scrape_jobs", fake_scrape_jobs)
+
+    criteria = {
+        "roles": ["Mechanical Engineer", "Aerospace Engineer"],
+        "title_exclusions": ["Senior", "Manager", "Director"],
+        "locations": ["Chicago, IL"],
+    }
+    search.fetch_all(criteria, results_per_board=10)
+
+    for term in captured_terms:
+        assert term is not None
+        assert "Mechanical Engineer" in term
+        assert "Aerospace Engineer" in term
+        assert "Senior" not in term
+        assert "Manager" not in term
+        assert "Director" not in term

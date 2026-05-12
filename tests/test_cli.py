@@ -42,6 +42,30 @@ def test_apply_hard_gates_empty_list_passes_everything():
     assert len(out) == 2
 
 
+def test_apply_hard_gates_warns_on_unrecognized_prefix(caplog):
+    """Bug D: free-text hard_gates entries without a known prefix get
+    silently no-oped at runtime. We emit a WARNING so users notice."""
+    import logging as _logging
+    listings = [_mk_listing("Mech Eng", "Acme")]
+    crit = {
+        **CRITERIA,
+        "hard_gates": [
+            "Military enlistment (excluded — not a job posting)",
+            "Rural / no major metro area",
+        ],
+    }
+    with caplog.at_level(_logging.WARNING, logger="job_discovery.cli"):
+        out = cli._apply_hard_gates(listings, crit)
+    # Listing passes through (gates aren't enforced — same behavior as before)
+    assert len(out) == 1
+    # But there are warnings for both unrecognized entries
+    warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+    assert len(warnings) == 2
+    msgs = " ".join(r.getMessage() for r in warnings)
+    assert "Military enlistment" in msgs
+    assert "Rural" in msgs
+
+
 def test_select_top_n_respects_threshold_and_cap():
     scored = [
         {"id": "a", "score": {"overall": 4.2}},

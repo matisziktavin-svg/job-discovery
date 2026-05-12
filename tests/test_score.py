@@ -84,6 +84,38 @@ def test_assemble_scoring_user_prompt_includes_listing_and_context():
     assert "aerospace eng" in prompt
 
 
+def test_rule_score_respects_title_exclusions():
+    """Bug A wiring: even rule-based fallback must give role_fit=1 to
+    titles matching criteria.title_exclusions."""
+    criteria_with_exclusions = {**CRITERIA_AERO, "title_exclusions": ["Senior", "Manager"]}
+    listing = {
+        "title": "Senior Mechanical Engineer",
+        "company": "Boeing",
+        "location": "Chicago, IL",
+        "salary": "$120K-$160K",
+        "description": "Hands-on mechanical design for aerospace propulsion.",
+    }
+    result = score.score_rule_based(listing, criteria_with_exclusions)
+    assert result["dims"]["role_fit"] == 1
+
+
+def test_assemble_scoring_user_prompt_includes_title_exclusions():
+    """Bug A wiring: title_exclusions must reach the LLM scorer so it can
+    enforce role_fit=1 for excluded titles."""
+    listing = {"title": "T", "company": "C", "location": "L",
+               "description": "d", "salary": ""}
+    criteria = {
+        "roles": ["Mech Eng"],
+        "title_exclusions": ["Senior", "Manager"],
+        "locations": ["Chicago, IL"],
+        "weights": {},
+    }
+    prompt = score._assemble_user_prompt(listing, criteria, {}, "")
+    assert '"title_exclusions"' in prompt
+    assert '"Senior"' in prompt
+    assert '"Manager"' in prompt
+
+
 def test_parse_score_response_valid_json():
     raw = '{"dims": {"role_fit": 5, "skills_match": 4, "seniority": 4, "domain": 5, "location": 5, "responsibilities": 5}, "one_line_take": "great fit"}'
     weights = {"role_fit": 1.5, "domain": 1.5, "skills_match": 1.0,

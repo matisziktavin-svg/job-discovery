@@ -4,9 +4,25 @@ Per-board failures are isolated. The orchestrator (cli.scan) is responsible
 for logging which boards succeeded.
 """
 import logging
+import math
 from typing import Iterable
 
 logger = logging.getLogger(__name__)
+
+
+def _is_real_number(v) -> bool:
+    """True iff `v` is a number that's safely convertible to int.
+    Filters None and pandas/numpy NaN (which is a float, so `is not None` is
+    True but `int(nan)` raises ValueError).
+    """
+    if v is None:
+        return False
+    try:
+        if isinstance(v, float) and math.isnan(v):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
 
 # Higher-quality sources first — used by dedupe() to pick a winner when the
 # same job appears on multiple boards.
@@ -19,9 +35,9 @@ def normalize_listing(raw: dict) -> dict:
     salary = ""
     mn = raw.get("min_amount")
     mx = raw.get("max_amount")
-    if mn is not None and mx is not None:
+    if _is_real_number(mn) and _is_real_number(mx):
         salary = f"${int(mn) // 1000}K-${int(mx) // 1000}K"
-    elif mn is not None:
+    elif _is_real_number(mn):
         salary = f"${int(mn) // 1000}K+"
 
     posted = raw.get("date_posted")
@@ -116,9 +132,20 @@ def fetch_all(criteria: dict, results_per_board: int = 50) -> tuple[list[dict], 
                 if df is None or df.empty:
                     status[key] = "ok (0 results)"
                     continue
+                # Per-listing isolation: a single bad row (e.g. unexpected
+                # types in a JobSpy field) must not drop the whole board's
+                # batch. The outer try/except handles fetch-level failures;
+                # this inner try/except handles per-row normalization.
+                bad_rows = 0
                 for _, row in df.iterrows():
-                    out.append(normalize_listing(row.to_dict()))
-                status[key] = "ok"
+                    try:
+                        out.append(normalize_listing(row.to_dict()))
+                    except Exception:
+                        bad_rows += 1
+                        logger.exception(
+                            "search.fetch_all: %s skipping malformed row", key,
+                        )
+                status[key] = "ok" if bad_rows == 0 else f"ok ({bad_rows} bad rows skipped)"
             except Exception as e:
                 logger.exception("search.fetch_all: %s failed", key)
                 status[key] = f"error: {type(e).__name__}: {e}"

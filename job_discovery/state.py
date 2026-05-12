@@ -72,6 +72,16 @@ _PASS_REASON_RE = re.compile(
     re.MULTILINE,
 )
 
+# Match "City, ST" — letters, spaces, periods, hyphens, apostrophes, ampersands
+# in the city; two-letter state. Used to filter prose bullets out of the
+# Locations list (e.g., a "Hard requirement: medium metro only" bullet under
+# ## Locations would otherwise be queried as a city).
+_CITY_RE = re.compile(r"^[A-Za-z][\w\s.&'\-]*?,\s*[A-Z]{2}$")
+
+# Heading text patterns indicating "this H3 sub-section under ## Roles is
+# about EXCLUDING titles, not including them." Case-insensitive substring.
+_EXCLUSION_H3_PATTERNS = ("exclusion", "exclude", "skip", "avoid", "filter out")
+
 
 def _criteria_path() -> Path:
     return _vault() / "projects" / "Job_Search" / "discovery" / "criteria.md"
@@ -110,16 +120,57 @@ def _bullet_lines(body: str) -> list[str]:
     return out
 
 
+def _split_h3_subsections(body: str) -> list[tuple[str, str]]:
+    """Split an H2 section's body into [(h3_heading_or_None, sub_body), ...].
+
+    Returned in document order. The first element's heading is None if the
+    section starts with content before any H3 (those bullets are still
+    "in" the H2 but not under any H3 sub-heading).
+    """
+    out: list[tuple[str | None, str]] = []
+    current_h3: str | None = None
+    current_lines: list[str] = []
+    for line in body.splitlines():
+        h = re.match(r"^###\s+(.+?)\s*$", line)
+        if h:
+            out.append((current_h3, "\n".join(current_lines).strip()))
+            current_h3 = h.group(1).strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+    out.append((current_h3, "\n".join(current_lines).strip()))
+    return out
+
+
+def _is_exclusion_h3(heading: str | None) -> bool:
+    if not heading:
+        return False
+    h = heading.lower()
+    return any(pat in h for pat in _EXCLUSION_H3_PATTERNS)
+
+
 def read_criteria() -> dict:
     """Parse criteria.md into a structured dict.
 
     Empty defaults if file missing — caller (cli.py scan) treats empty
     criteria as a signal to trigger the onboarding interview via Mizzix.
+
+    Section semantics:
+      `## Roles`
+        H3 sub-sections are honored. Any H3 whose heading contains
+        "exclusion"/"exclude"/"skip"/"avoid"/"filter out" splits its bullets
+        into `title_exclusions` instead of `roles`. Bullets directly under
+        ## Roles (no H3) are treated as roles.
+      `## Locations`
+        All bullets are candidate locations, but only those matching the
+        `City, ST` pattern survive. Prose bullets (e.g. notes accidentally
+        written under ## Locations) are silently dropped.
     """
     path = _criteria_path()
     empty = {
         "roles": [],
         "locations": [],
+        "title_exclusions": [],
         "salary_floor": None,
         "hard_gates": [],
         "weights": {},
@@ -135,8 +186,25 @@ def read_criteria() -> dict:
 
     sections = _split_sections(text)
     out = dict(empty)
-    out["roles"] = _bullet_lines(sections.get("roles", ""))
-    out["locations"] = _bullet_lines(sections.get("locations", ""))
+
+    # Roles: split by H3, route exclusion sub-sections separately.
+    roles: list[str] = []
+    title_exclusions: list[str] = []
+    for h3, sub_body in _split_h3_subsections(sections.get("roles", "")):
+        bullets = _bullet_lines(sub_body)
+        if _is_exclusion_h3(h3):
+            title_exclusions.extend(bullets)
+        else:
+            roles.extend(bullets)
+    out["roles"] = roles
+    out["title_exclusions"] = title_exclusions
+
+    # Locations: collect all bullets across H3 sub-sections, then keep only
+    # those that look like "City, ST". Drops prose accidentally written here.
+    location_bullets: list[str] = []
+    for _h3, sub_body in _split_h3_subsections(sections.get("locations", "")):
+        location_bullets.extend(_bullet_lines(sub_body))
+    out["locations"] = [b for b in location_bullets if _CITY_RE.match(b)]
 
     salary_body = sections.get("salary floor", "").strip()
     if salary_body:

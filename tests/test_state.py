@@ -178,6 +178,117 @@ def test_append_pass_reason_preserves_existing_content(tmp_path, monkeypatch):
     assert "**2026-05-12** — New (Denver) — weak fit" in text  # appended
 
 
+# -----------------------------------------------------------------------------
+# Bug fixes from Mizzix's 2026-05-12 onboarding scan
+# -----------------------------------------------------------------------------
+
+
+CRITERIA_WITH_H3_SUBSECTIONS = """\
+# Job Search Criteria
+
+## Roles
+
+### High priority titles
+- Mechanical Engineer
+- Aerospace Engineer
+
+### Secondary titles
+- Systems Engineer
+- Test Engineer
+
+### Title exclusions (always skip)
+- Senior
+- Sr.
+- Manager
+- Director
+
+## Locations
+
+### Tier 1 — top targets
+- Chicago, IL
+- Milwaukee, WI
+
+### Tier 2 — major metros
+- New York City, NY
+- Boston, MA
+
+### Location notes
+- Hard requirement: medium to major metro area only
+- Avoid Texas and Florida
+
+## Salary floor
+60000
+"""
+
+
+def test_read_criteria_treats_h3_subsections_as_part_of_parent_h2(tmp_path, monkeypatch):
+    """H3 sub-headings under ## Roles split into roles vs title_exclusions
+    based on the H3 heading text. Without this, exclusions would be parsed
+    as target roles and surfaced in the search query.
+    """
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True)
+    crit_path.write_text(CRITERIA_WITH_H3_SUBSECTIONS, encoding="utf-8")
+
+    crit = state.read_criteria()
+    # Target roles include only the high-priority + secondary titles, NOT exclusions
+    assert "Mechanical Engineer" in crit["roles"]
+    assert "Aerospace Engineer" in crit["roles"]
+    assert "Systems Engineer" in crit["roles"]
+    assert "Test Engineer" in crit["roles"]
+    assert "Senior" not in crit["roles"]
+    assert "Manager" not in crit["roles"]
+    assert "Director" not in crit["roles"]
+
+    # title_exclusions surfaced as a separate field
+    assert "title_exclusions" in crit
+    assert "Senior" in crit["title_exclusions"]
+    assert "Sr." in crit["title_exclusions"]
+    assert "Manager" in crit["title_exclusions"]
+    assert "Director" in crit["title_exclusions"]
+
+
+def test_read_criteria_filters_non_city_bullets_from_locations(tmp_path, monkeypatch):
+    """Bullets under ## Locations that don't match City, ST pattern get
+    skipped — protects against prose like 'Hard requirement: medium metro
+    area only' being queried as a city.
+    """
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True)
+    crit_path.write_text(CRITERIA_WITH_H3_SUBSECTIONS, encoding="utf-8")
+
+    crit = state.read_criteria()
+    assert "Chicago, IL" in crit["locations"]
+    assert "Milwaukee, WI" in crit["locations"]
+    assert "New York City, NY" in crit["locations"]
+    assert "Boston, MA" in crit["locations"]
+    # The prose bullets must NOT be in locations
+    assert not any("Hard requirement" in loc for loc in crit["locations"])
+    assert not any("Avoid Texas" in loc for loc in crit["locations"])
+
+
+def test_read_criteria_title_exclusions_default_to_empty_list_when_absent(tmp_path, monkeypatch):
+    """When criteria.md has no title-exclusion sub-section, the field is
+    still present on the dict (as []) so downstream consumers don't KeyError.
+    """
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True)
+    crit_path.write_text(CRITERIA_FIXTURE, encoding="utf-8")  # the original fixture
+
+    crit = state.read_criteria()
+    assert crit["title_exclusions"] == []
+
+
+def test_read_criteria_returns_empty_when_missing_includes_title_exclusions(tmp_path, monkeypatch):
+    """Empty defaults must include the new field too."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit = state.read_criteria()
+    assert crit["title_exclusions"] == []
+
+
 def test_append_application_creates_table(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
     state.append_application(

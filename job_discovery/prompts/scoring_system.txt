@@ -12,6 +12,8 @@ DIMENSIONS — each scored 1-5 integer:
 
 CRITICAL — read Tavin's `preferences.recent_pass_reasons` and `preferences.learned_patterns` in the input. They reflect his evolving taste. If a listing matches a recent rejection pattern (e.g. "too senior", "defense-heavy", "actually 90 min outside Denver"), score it accordingly.
 
+ALSO CRITICAL — `criteria.title_exclusions` is a hard do-not-surface list. If the listing's title contains ANY substring from `title_exclusions` (case-insensitive), set `role_fit = 1` regardless of other signals. Example: if `title_exclusions` includes "Senior" and the title is "Senior Mechanical Engineer", role_fit = 1 — Tavin doesn't want senior-level roles. Mention the exclusion match in `one_line_take` (e.g. "title-excluded: Senior").
+
 OUTPUT — single JSON object, no markdown fence, no prose:
 
 {

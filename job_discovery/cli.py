@@ -40,15 +40,26 @@ def _load_profile_blob() -> str:
 def _apply_hard_gates(listings: list[dict], criteria: dict) -> list[dict]:
     """Drop any listing matching a hard gate. Currently supported:
         company:<name>     — exact company match (case-insensitive)
+
+    Unrecognized gate prefixes are silently ignored at runtime but logged
+    at WARNING so users notice their gates aren't enforced (Bug D regression
+    guard — earlier impl was silent and Tavin had two prose gates that did
+    nothing without any indication).
     """
     gates = criteria.get("hard_gates") or []
     if not gates:
         return list(listings)
-    blocked_companies = {
-        g.split(":", 1)[1].strip().lower()
-        for g in gates
-        if g.lower().startswith("company:")
-    }
+    blocked_companies: set[str] = set()
+    for g in gates:
+        if g.lower().startswith("company:"):
+            blocked_companies.add(g.split(":", 1)[1].strip().lower())
+        else:
+            logger.warning(
+                "_apply_hard_gates: unsupported gate %r ignored. "
+                "Supported prefixes: company:<name>. "
+                "Move free-text rules to ## Notes (the LLM scorer reads them).",
+                g,
+            )
     return [
         l for l in listings
         if (l.get("company") or "").strip().lower() not in blocked_companies

@@ -59,6 +59,12 @@ def _score_role_fit(listing: dict, criteria: dict) -> int:
     title = (listing.get("title") or "").lower()
     if not title:
         return 1
+    # Title exclusions from criteria.md — substring-match (case-insensitive)
+    # so "Senior" matches "Senior Mechanical Engineer." Mirrors the rule the
+    # LLM scorer is asked to enforce in scoring_system.txt.
+    title_exclusions = [t.lower() for t in criteria.get("title_exclusions", []) if t]
+    if any(excl in title for excl in title_exclusions):
+        return 1
     # Sales/Support/Customer-Success "Engineer" titles are clearly off-target
     # even though they contain "engineer". Catch them before the word match.
     if "engineer" in title and _kw_hit(title, _NON_TARGET_QUALIFIERS):
@@ -226,6 +232,7 @@ def _assemble_user_prompt(
         },
         "criteria": {
             "roles": criteria.get("roles", []),
+            "title_exclusions": criteria.get("title_exclusions", []),
             "locations": criteria.get("locations", []),
             "salary_floor": criteria.get("salary_floor"),
             "notes": criteria.get("notes", ""),
