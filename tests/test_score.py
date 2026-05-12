@@ -63,3 +63,47 @@ def test_rule_score_one_line_take_includes_signals():
     result = score.score_rule_based(listing, CRITERIA_AERO)
     assert result["one_line_take"]
     assert len(result["one_line_take"]) <= 200
+
+
+def test_assemble_scoring_user_prompt_includes_listing_and_context():
+    listing = {
+        "title": "Mech Eng", "company": "Acme", "location": "Chicago",
+        "description": "Design things.", "salary": "$80K",
+    }
+    criteria = {"roles": ["Mech Eng"], "locations": ["Chicago, IL"], "weights": {}}
+    preferences = {
+        "learned_patterns": "Skip defense",
+        "recent_pass_reasons": [{"date": "2026-05-10", "text": "too senior"}],
+    }
+    profile_blob = "Tavin: aerospace eng, mid-IC."
+    prompt = score._assemble_user_prompt(listing, criteria, preferences, profile_blob)
+    assert "Mech Eng" in prompt
+    assert "Acme" in prompt
+    assert "Skip defense" in prompt
+    assert "too senior" in prompt
+    assert "aerospace eng" in prompt
+
+
+def test_parse_score_response_valid_json():
+    raw = '{"dims": {"role_fit": 5, "skills_match": 4, "seniority": 4, "domain": 5, "location": 5, "responsibilities": 5}, "one_line_take": "great fit"}'
+    weights = {"role_fit": 1.5, "domain": 1.5, "skills_match": 1.0,
+               "seniority": 1.0, "location": 1.0, "responsibilities": 1.0}
+    result = score._parse_score_response(raw, weights)
+    assert result is not None
+    assert result["dims"]["role_fit"] == 5
+    assert result["overall"] >= 4.5
+    assert result["one_line_take"] == "great fit"
+    assert result["method"] == "llm"
+
+
+def test_parse_score_response_handles_markdown_fence():
+    raw = "```json\n{\"dims\": {\"role_fit\": 3, \"skills_match\": 3, \"seniority\": 3, \"domain\": 3, \"location\": 3, \"responsibilities\": 3}, \"one_line_take\": \"meh\"}\n```"
+    weights = {}  # equal weights
+    result = score._parse_score_response(raw, weights)
+    assert result is not None
+    assert result["overall"] == 3.0
+
+
+def test_parse_score_response_returns_none_on_garbage():
+    assert score._parse_score_response("not json at all", {}) is None
+    assert score._parse_score_response("", {}) is None

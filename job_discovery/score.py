@@ -19,7 +19,12 @@ Both return the same shape:
       "method": "llm" | "fallback",
     }
 """
+import asyncio
+import json
 import logging
+import os
+import re
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -191,3 +196,151 @@ def score_rule_based(listing: dict, criteria: dict) -> dict:
         "one_line_take": take[:200],
         "method": "fallback",
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM-based scoring (primary path)
+# ---------------------------------------------------------------------------
+
+# Strip ```json ... ``` fences if the model emits them.
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+
+def _strip_fence(text: str) -> str:
+    m = _FENCE_RE.match(text)
+    return m.group(1) if m else text.strip()
+
+
+def _assemble_user_prompt(
+    listing: dict, criteria: dict, preferences: dict, profile_blob: str,
+) -> str:
+    payload = {
+        "listing": {
+            "title": listing.get("title", ""),
+            "company": listing.get("company", ""),
+            "location": listing.get("location", ""),
+            "salary": listing.get("salary", ""),
+            "description": listing.get("description", "")[:4000],  # cap to keep prompt sane
+        },
+        "criteria": {
+            "roles": criteria.get("roles", []),
+            "locations": criteria.get("locations", []),
+            "salary_floor": criteria.get("salary_floor"),
+            "notes": criteria.get("notes", ""),
+        },
+        "preferences": {
+            "learned_patterns": preferences.get("learned_patterns", ""),
+            "recent_pass_reasons": preferences.get("recent_pass_reasons", [])[:30],
+        },
+    }
+    return (
+        "Tavin's profile (excerpt from tavin.md and Job_Search/README.md):\n\n"
+        + profile_blob
+        + "\n\nJob to score:\n\n```json\n"
+        + json.dumps(payload, indent=2, default=str)
+        + "\n```\n\nRespond with the JSON object only."
+    )
+
+
+def _parse_score_response(raw: str, weights: dict) -> dict | None:
+    raw = _strip_fence(raw or "")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("score: could not parse JSON: %s", raw[:200])
+        return None
+    dims = data.get("dims")
+    if not isinstance(dims, dict):
+        return None
+    required = ["role_fit", "skills_match", "seniority", "domain", "location", "responsibilities"]
+    if not all(k in dims for k in required):
+        logger.warning("score: missing required dims in %s", dims)
+        return None
+    if not all(isinstance(dims[k], int) and 1 <= dims[k] <= 5 for k in required):
+        logger.warning("score: dim out of range in %s", dims)
+        return None
+    take = (data.get("one_line_take") or "").strip()[:200]
+
+    if not weights:
+        weights = {k: 1.0 for k in required}
+    weighted_sum = sum(dims[k] * weights.get(k, 1.0) for k in required)
+    weight_total = sum(weights.get(k, 1.0) for k in required)
+    overall = round(weighted_sum / weight_total, 1) if weight_total else 0.0
+
+    return {
+        "overall": overall,
+        "dims": dims,
+        "one_line_take": take,
+        "method": "llm",
+    }
+
+
+async def score_llm(
+    listing: dict, criteria: dict, preferences: dict, profile_blob: str,
+    model: str | None = None,
+) -> dict | None:
+    """Score one listing via Claude Agent SDK. Returns None on failure
+    (caller should fall back to score_rule_based).
+
+    Mirrors morning_brief.py / heartbeat.py SDK setup pattern."""
+    # Inherit Claude Max OAuth — same dance Mizzix's other LLM callers do.
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    from claude_agent_sdk import (
+        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock,
+    )
+
+    prompt_dir = Path(os.environ["VAULT_PATH"]) / ".mizzix_state"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    system_prompt_text = (
+        Path(__file__).parent / "prompts" / "scoring_system.txt"
+    ).read_text(encoding="utf-8")
+    system_path = prompt_dir / "job_discovery_scoring_prompt.txt"
+    system_path.write_text(system_prompt_text, encoding="utf-8")
+
+    user_prompt = _assemble_user_prompt(listing, criteria, preferences, profile_blob)
+
+    options = ClaudeAgentOptions(
+        system_prompt={"type": "file", "path": str(system_path)},
+        cwd=os.environ["VAULT_PATH"],
+        allowed_tools=[],
+        permission_mode="bypassPermissions",
+        model=model or os.environ.get("MIZZIX_MODEL", "claude-sonnet-4-6"),
+    )
+
+    client = ClaudeSDKClient(options=options)
+    try:
+        await client.connect()
+        try:
+            await client.query(user_prompt)
+            chunks: list[str] = []
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            chunks.append(block.text)
+            raw = "".join(chunks)
+        finally:
+            await client.disconnect()
+    except Exception:
+        logger.exception("score_llm: SDK call crashed")
+        return None
+
+    return _parse_score_response(raw, criteria.get("weights") or {})
+
+
+def score_listing(
+    listing: dict, criteria: dict, preferences: dict, profile_blob: str,
+    model: str | None = None,
+) -> dict:
+    """Synchronous facade: try LLM, fall back to rule-based on failure."""
+    try:
+        result = asyncio.run(score_llm(listing, criteria, preferences, profile_blob, model))
+    except Exception:
+        logger.exception("score_listing: LLM scoring crashed")
+        result = None
+    if result is None:
+        result = score_rule_based(listing, criteria)
+    return result
