@@ -10,6 +10,7 @@ VAULT_PATH env var must point at the Second Brain vault root.
 import json
 import logging
 import os
+import re
 import secrets
 from pathlib import Path
 
@@ -65,8 +66,6 @@ def load_history() -> list[dict]:
 def save_history(items: list[dict]) -> None:
     _save(_history_path(), items)
 
-
-import re
 
 _PASS_REASON_RE = re.compile(
     r"^-\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[—–-]\s*(.+?)\s*$",
