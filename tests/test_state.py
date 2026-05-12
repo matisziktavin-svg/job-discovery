@@ -49,3 +49,93 @@ def test_new_match_id_format():
     mid = state.new_match_id()
     assert mid.startswith("jm_")
     assert len(mid) == 11  # "jm_" + 8 hex chars
+
+
+CRITERIA_FIXTURE = """\
+# Job Search Criteria
+
+## Roles
+- Mechanical Design Engineer
+- Thermal Engineer
+- Test Engineer
+
+## Locations
+- Chicago, IL
+- Milwaukee, WI
+- Seattle, WA
+- Denver, CO
+
+## Salary floor
+70000
+
+## Hard gates
+(none)
+
+## Weights
+- role_fit: 1.5
+- domain: 1.5
+- skills_match: 1.0
+- seniority: 1.0
+- location: 1.0
+- responsibilities: 1.0
+
+## Notes
+Open to AI engineering if founding-tools-shaped.
+"""
+
+
+def test_read_criteria_parses_sections(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True)
+    crit_path.write_text(CRITERIA_FIXTURE, encoding="utf-8")
+
+    crit = state.read_criteria()
+    assert crit["roles"] == [
+        "Mechanical Design Engineer", "Thermal Engineer", "Test Engineer",
+    ]
+    assert "Chicago, IL" in crit["locations"]
+    assert crit["salary_floor"] == 70000
+    assert crit["weights"]["role_fit"] == 1.5
+    assert crit["weights"]["skills_match"] == 1.0
+    assert crit["hard_gates"] == []
+    assert "AI engineering" in crit["notes"]
+
+
+def test_read_criteria_returns_empty_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit = state.read_criteria()
+    # Empty defaults — caller decides what to do (likely trigger onboarding)
+    assert crit["roles"] == []
+    assert crit["locations"] == []
+    assert crit["salary_floor"] is None
+    assert crit["weights"] == {}
+
+
+def test_read_preferences_returns_recent_pass_reasons(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    pref_path = tmp_path / "projects" / "Job_Search" / "discovery" / "preferences.md"
+    pref_path.parent.mkdir(parents=True)
+    pref_path.write_text("""\
+# Preferences
+
+## Learned patterns
+- Skip startups under 50 people
+
+## Pass reasons (raw)
+- **2026-05-10** — Anduril (Costa Mesa) — too defense-heavy, not interested
+- **2026-05-09** — XYZ (Phoenix) — wanted senior+, I'm mid
+- **2026-05-09** — ABC (Boston) — no relocation help
+""", encoding="utf-8")
+
+    prefs = state.read_preferences()
+    assert "Skip startups under 50" in prefs["learned_patterns"]
+    assert len(prefs["recent_pass_reasons"]) == 3
+    assert prefs["recent_pass_reasons"][0]["date"] == "2026-05-10"
+    assert "defense-heavy" in prefs["recent_pass_reasons"][0]["text"]
+
+
+def test_read_preferences_empty_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    prefs = state.read_preferences()
+    assert prefs == {"learned_patterns": "", "recent_pass_reasons": []}
