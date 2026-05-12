@@ -1,10 +1,12 @@
 """Scoring agent for job listings.
 
-Two paths:
-  - score_llm(): primary, uses Claude Agent SDK with criteria + preferences as context
-  - score_rule_based(): fallback for when the API call fails. Pure keyword overlap.
+Public API:
+  - score_listing(): synchronous facade — the entry point cli.py uses. Tries
+    LLM, falls back to rule-based on any failure.
+  - score_llm(): async primary path via Claude Agent SDK.
+  - score_rule_based(): pure keyword overlap fallback.
 
-Both return the same shape:
+All three return the same shape:
     {
       "overall": float,                 # 1.0-5.0
       "dims": {
@@ -285,13 +287,22 @@ async def score_llm(
     (caller should fall back to score_rule_based).
 
     Mirrors morning_brief.py / heartbeat.py SDK setup pattern."""
-    # Inherit Claude Max OAuth — same dance Mizzix's other LLM callers do.
+    # Force OAuth path: if ANTHROPIC_API_KEY is set in the environment, the
+    # SDK uses it instead of Tavin's Claude Max OAuth. Popping it (process-
+    # wide) ensures all scoring runs go through the Max subscription. Same
+    # pattern Mizzix uses; fine because nothing else in this process needs
+    # the key.
     os.environ.pop("ANTHROPIC_API_KEY", None)
 
     from claude_agent_sdk import (
         AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock,
     )
 
+    # SDK requires the system prompt as a file path (not an inline string)
+    # to dodge Windows' 32KB CreateProcess command-line limit. We write the
+    # template's contents to .mizzix_state/ on every call. Concurrent scores
+    # would race here but the contents are identical (same source file), so
+    # last-writer-wins is harmless.
     prompt_dir = Path(os.environ["VAULT_PATH"]) / ".mizzix_state"
     prompt_dir.mkdir(parents=True, exist_ok=True)
     system_prompt_text = (
@@ -335,7 +346,13 @@ def score_listing(
     listing: dict, criteria: dict, preferences: dict, profile_blob: str,
     model: str | None = None,
 ) -> dict:
-    """Synchronous facade: try LLM, fall back to rule-based on failure."""
+    """Synchronous facade: try LLM, fall back to rule-based on failure.
+
+    Must be called from a sync context (cli.py + cron). `asyncio.run()`
+    will raise `RuntimeError` if invoked while another event loop is
+    running — if a future caller is async (Jupyter, async CLI), they
+    should call `score_llm` directly with `await` instead.
+    """
     try:
         result = asyncio.run(score_llm(listing, criteria, preferences, profile_blob, model))
     except Exception:
