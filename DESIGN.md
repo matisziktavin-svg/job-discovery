@@ -1,6 +1,6 @@
 # job-discovery — Design Spec
 
-*Drafted 2026-05-12. Status: design approved, awaiting implementation plan.*
+*Drafted 2026-05-12. Status: **shipped 2026-05-12** (live cron + Mizzix integration). Awaiting onboarding interview to populate `criteria.md`.*
 
 A daily job-discovery system for Tavin, integrated into Mizzix (his Discord life-OS bot). Surfaces top-N matching engineering postings each morning, learns from his pass-reasons, and hands off to the existing `interview-coach` skill when a match is worth pursuing.
 
