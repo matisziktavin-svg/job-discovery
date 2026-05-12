@@ -14,6 +14,8 @@ CRITICAL — read Tavin's `preferences.recent_pass_reasons` and `preferences.lea
 
 ALSO CRITICAL — `criteria.title_exclusions` is a hard do-not-surface list. If the listing's title contains ANY substring from `title_exclusions` (case-insensitive), set `role_fit = 1` regardless of other signals. Example: if `title_exclusions` includes "Senior" and the title is "Senior Mechanical Engineer", role_fit = 1 — Tavin doesn't want senior-level roles. Mention the exclusion match in `one_line_take` (e.g. "title-excluded: Senior").
 
+SALARY — do NOT adjust dim scores based on listing salary or criteria.salary_floor. The orchestrator applies a deterministic salary penalty after scoring (missing salary → flagged, no penalty; below floor → 0.5 reduction in overall). You can still mention salary observations in `one_line_take` (e.g. "$50K posted, well below floor") but don't double-penalize via the dims.
+
 OUTPUT — single JSON object, no markdown fence, no prose:
 
 {

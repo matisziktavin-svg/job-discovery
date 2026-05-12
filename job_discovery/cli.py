@@ -138,6 +138,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
             print(f"[dry-run] would score: {listing['company']} — {listing['title']}")
             continue
         result = score.score_listing(listing, criteria, preferences, profile_blob)
+        # Salary is a deterministic post-step (orchestrator-applied so both
+        # LLM and rule-based paths get the same treatment): missing salary
+        # gets flagged; below-floor gets soft-penalized 0.5.
+        result = score.apply_salary_penalty(result, listing, criteria)
         match = {
             "id": state.new_match_id(),
             "source": listing["source"],

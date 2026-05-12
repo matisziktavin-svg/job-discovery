@@ -139,3 +139,82 @@ def test_parse_score_response_handles_markdown_fence():
 def test_parse_score_response_returns_none_on_garbage():
     assert score._parse_score_response("not json at all", {}) is None
     assert score._parse_score_response("", {}) is None
+
+
+# -----------------------------------------------------------------------------
+# Salary handling: missing salary stays, below-floor gets soft penalty
+# -----------------------------------------------------------------------------
+
+
+def test_extract_salary_min_handles_common_formats():
+    assert score._extract_salary_min("$70K-$90K") == 70000
+    assert score._extract_salary_min("$70K+") == 70000
+    assert score._extract_salary_min("$120K-$160K") == 120000
+    assert score._extract_salary_min("") is None
+    assert score._extract_salary_min(None) is None
+    assert score._extract_salary_min("competitive") is None
+
+
+def _mk_score_result(overall=4.0, take="strong fit"):
+    return {
+        "overall": overall,
+        "dims": {"role_fit": 4, "skills_match": 4, "seniority": 4,
+                 "domain": 4, "location": 4, "responsibilities": 4},
+        "one_line_take": take,
+        "method": "llm",
+    }
+
+
+def test_apply_salary_penalty_no_floor_no_change():
+    """No salary_floor in criteria → no adjustment."""
+    listing = {"salary": "$50K"}
+    criteria = {}  # no salary_floor
+    result = score.apply_salary_penalty(_mk_score_result(4.0), listing, criteria)
+    assert result["overall"] == 4.0
+    assert "below floor" not in result["one_line_take"]
+
+
+def test_apply_salary_penalty_no_listing_salary_flagged_not_penalized():
+    """Missing salary in listing → flag in one_line_take, no overall change."""
+    listing = {"salary": ""}
+    criteria = {"salary_floor": 60000}
+    result = score.apply_salary_penalty(_mk_score_result(4.0), listing, criteria)
+    assert result["overall"] == 4.0
+    assert "salary not posted" in result["one_line_take"].lower()
+
+
+def test_apply_salary_penalty_above_floor_no_change():
+    """Listing salary >= floor → no penalty, no flag."""
+    listing = {"salary": "$80K-$100K"}
+    criteria = {"salary_floor": 60000}
+    result = score.apply_salary_penalty(_mk_score_result(4.0), listing, criteria)
+    assert result["overall"] == 4.0
+    assert "below floor" not in result["one_line_take"]
+
+
+def test_apply_salary_penalty_below_floor_soft_penalty():
+    """Listing salary < floor → reduce overall by 0.5, append 'below floor' note."""
+    listing = {"salary": "$50K-$55K"}
+    criteria = {"salary_floor": 60000}
+    result = score.apply_salary_penalty(_mk_score_result(4.0), listing, criteria)
+    assert result["overall"] == 3.5
+    assert "below floor" in result["one_line_take"].lower()
+    assert "$50K" in result["one_line_take"] or "50" in result["one_line_take"]
+
+
+def test_apply_salary_penalty_clamps_at_1():
+    """Penalty floors overall at 1.0 even if pre-penalty is already low."""
+    listing = {"salary": "$30K"}
+    criteria = {"salary_floor": 60000}
+    result = score.apply_salary_penalty(_mk_score_result(1.2), listing, criteria)
+    assert result["overall"] == 1.0
+
+
+def test_apply_salary_penalty_does_not_mutate_input():
+    """apply_salary_penalty returns a new dict — input unchanged."""
+    listing = {"salary": "$50K"}
+    criteria = {"salary_floor": 60000}
+    original = _mk_score_result(4.0)
+    score.apply_salary_penalty(original, listing, criteria)
+    assert original["overall"] == 4.0
+    assert "below floor" not in original["one_line_take"]

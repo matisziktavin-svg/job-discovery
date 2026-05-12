@@ -207,6 +207,73 @@ def score_rule_based(listing: dict, criteria: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Salary handling — applied after scoring as a deterministic post-step.
+# Both the LLM and rule-based scorers ignore salary in their dim scores;
+# the orchestrator (cli.cmd_scan) calls apply_salary_penalty on the result.
+# ---------------------------------------------------------------------------
+
+# Match "$70K", "$120K", etc. — the first number-K token in a salary string.
+_SALARY_K_RE = re.compile(r"\$(\d+)K", re.IGNORECASE)
+
+
+def _extract_salary_min(salary_str) -> int | None:
+    """Pull the first '$NK' value out of a salary string and return it as
+    an int (e.g. '$70K-$90K' → 70000, '$70K+' → 70000). None if no match.
+    """
+    if not salary_str or not isinstance(salary_str, str):
+        return None
+    m = _SALARY_K_RE.search(salary_str)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) * 1000
+    except ValueError:
+        return None
+
+
+def apply_salary_penalty(score_result: dict, listing: dict, criteria: dict) -> dict:
+    """Post-scoring salary adjustment. Returns a NEW dict — does not mutate.
+
+    Behavior (per Tavin 2026-05-12 design call):
+      - No salary_floor in criteria → no change
+      - Listing salary missing → no penalty, but flag in one_line_take
+      - Listing salary >= floor → no change
+      - Listing salary < floor → reduce overall by 0.5 (clamped to 1.0 min),
+        append "below floor: $XK posted vs $YK floor" to one_line_take
+    """
+    out = {**score_result, "dims": dict(score_result.get("dims", {}))}
+    take = (out.get("one_line_take") or "").strip()
+
+    salary_floor = criteria.get("salary_floor")
+    listing_salary = listing.get("salary", "")
+    listing_min = _extract_salary_min(listing_salary)
+
+    if salary_floor is None:
+        return out
+
+    if listing_min is None:
+        # Missing salary → flag but don't penalize
+        flag = "salary not posted"
+        if flag not in take.lower():
+            take = (take + " — " + flag) if take else flag
+            out["one_line_take"] = take[:200]
+        return out
+
+    if listing_min < salary_floor:
+        # Below floor → soft penalty (0.5 off, min 1.0) + flag
+        out["overall"] = max(1.0, round(out["overall"] - 0.5, 1))
+        flag = (
+            f"below floor: ${listing_min // 1000}K posted "
+            f"vs ${salary_floor // 1000}K floor"
+        )
+        if flag not in take:
+            take = (take + " — " + flag) if take else flag
+            out["one_line_take"] = take[:200]
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # LLM-based scoring (primary path)
 # ---------------------------------------------------------------------------
 
