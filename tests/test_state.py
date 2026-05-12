@@ -139,3 +139,56 @@ def test_read_preferences_empty_when_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
     prefs = state.read_preferences()
     assert prefs == {"learned_patterns": "", "recent_pass_reasons": []}
+
+
+def test_append_pass_reason_creates_file_with_section(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_pass_reason(
+        date="2026-05-12",
+        company="Acme",
+        location="Chicago, IL",
+        reason="too senior, wants 8+ yrs",
+    )
+    pref_path = tmp_path / "projects" / "Job_Search" / "discovery" / "preferences.md"
+    text = pref_path.read_text(encoding="utf-8")
+    assert "## Pass reasons (raw)" in text
+    assert "**2026-05-12** — Acme (Chicago, IL) — too senior" in text
+
+
+def test_append_pass_reason_preserves_existing_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    pref_path = tmp_path / "projects" / "Job_Search" / "discovery" / "preferences.md"
+    pref_path.parent.mkdir(parents=True)
+    pref_path.write_text("""\
+# Preferences
+
+## Learned patterns
+- Skip defense
+
+## Pass reasons (raw)
+- **2026-05-10** — Old (Boston) — too far
+""", encoding="utf-8")
+
+    state.append_pass_reason(
+        date="2026-05-12", company="New", location="Denver", reason="weak fit",
+    )
+    text = pref_path.read_text(encoding="utf-8")
+    assert "Skip defense" in text  # preserved
+    assert "Old (Boston)" in text  # preserved
+    assert "**2026-05-12** — New (Denver) — weak fit" in text  # appended
+
+
+def test_append_application_creates_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_application(
+        date="2026-05-12",
+        company="Acme",
+        title="Mech Design Eng",
+        location="Chicago, IL",
+        url="https://example.com/jobs/123",
+    )
+    app_path = tmp_path / "projects" / "Job_Search" / "discovery" / "applications.md"
+    text = app_path.read_text(encoding="utf-8")
+    assert "| Date | Company | Title | Location | URL | Status |" in text
+    assert "| 2026-05-12 | Acme | Mech Design Eng | Chicago, IL |" in text
+    assert "| applied |" in text

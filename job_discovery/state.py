@@ -192,3 +192,86 @@ def read_preferences() -> dict:
     ]
     reasons.sort(key=lambda r: r["date"], reverse=True)
     return {"learned_patterns": learned, "recent_pass_reasons": reasons}
+
+
+_PREFERENCES_TEMPLATE = """\
+# Preferences
+
+*Auto-managed: pass-reasons appended by EOD check-in. Edit "Learned patterns"
+section by hand or let the weekly retro distill recurring patterns.*
+
+## Learned patterns
+
+(none yet)
+
+## Pass reasons (raw)
+
+"""
+
+_APPLICATIONS_TEMPLATE = """\
+# Applications
+
+*Auto-managed: applied jobs appended by EOD check-in. Most apps die without
+response — those stay here. Active interview loops live in `../README.md`.*
+
+| Date | Company | Title | Location | URL | Status |
+|---|---|---|---|---|---|
+"""
+
+
+def _applications_path() -> Path:
+    return _vault() / "projects" / "Job_Search" / "discovery" / "applications.md"
+
+
+def append_pass_reason(date: str, company: str, location: str, reason: str) -> None:
+    """Append a pass-reason entry to preferences.md, creating the file if
+    needed. Never destructive — always appends to the existing
+    "## Pass reasons (raw)" section.
+    """
+    path = _preferences_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    location_str = f" ({location})" if location else ""
+    line = f"- **{date}** — {company}{location_str} — {reason}\n"
+
+    if not path.exists():
+        path.write_text(_PREFERENCES_TEMPLATE + line, encoding="utf-8")
+        return
+
+    text = path.read_text(encoding="utf-8")
+    if "## Pass reasons (raw)" not in text:
+        # Section missing — append the section + entry at end of file
+        sep = "" if text.endswith("\n") else "\n"
+        path.write_text(text + sep + "\n## Pass reasons (raw)\n\n" + line, encoding="utf-8")
+        return
+
+    # Append to end of "## Pass reasons (raw)" section. Find where the next
+    # section starts (or EOF) and insert there.
+    section_start = text.index("## Pass reasons (raw)")
+    rest = text[section_start:]
+    next_h2 = re.search(r"\n##\s+\S", rest[len("## Pass reasons (raw)"):])
+    if next_h2:
+        insert_at = section_start + len("## Pass reasons (raw)") + next_h2.start()
+        # Strip trailing whitespace from section before inserting
+        new_text = text[:insert_at].rstrip() + "\n" + line + "\n" + text[insert_at:]
+    else:
+        # Section is the last one; append to EOF
+        sep = "" if text.endswith("\n") else "\n"
+        new_text = text + sep + line
+    path.write_text(new_text, encoding="utf-8")
+
+
+def append_application(
+    date: str, company: str, title: str, location: str, url: str,
+    status: str = "applied",
+) -> None:
+    """Append a row to applications.md, creating the file with header if needed."""
+    path = _applications_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = f"| {date} | {company} | {title} | {location} | {url} | {status} |\n"
+    if not path.exists():
+        path.write_text(_APPLICATIONS_TEMPLATE + row, encoding="utf-8")
+        return
+    text = path.read_text(encoding="utf-8")
+    sep = "" if text.endswith("\n") else "\n"
+    path.write_text(text + sep + row, encoding="utf-8")
