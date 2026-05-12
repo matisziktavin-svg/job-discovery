@@ -4,7 +4,7 @@ Per-board failures are isolated. The orchestrator (cli.scan) is responsible
 for logging which boards succeeded.
 """
 import logging
-from typing import Any, Iterable
+from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +19,9 @@ def normalize_listing(raw: dict) -> dict:
     salary = ""
     mn = raw.get("min_amount")
     mx = raw.get("max_amount")
-    if mn and mx:
+    if mn is not None and mx is not None:
         salary = f"${int(mn) // 1000}K-${int(mx) // 1000}K"
-    elif mn:
+    elif mn is not None:
         salary = f"${int(mn) // 1000}K+"
 
     posted = raw.get("date_posted")
@@ -80,11 +80,13 @@ def filter_unseen(listings: list[dict], seen_keys: Iterable[str]) -> list[dict]:
 
 
 def fetch_all(criteria: dict, results_per_board: int = 50) -> tuple[list[dict], dict[str, str]]:
-    """Run JobSpy against each board with criteria-derived params. Returns:
+    """Run JobSpy against each (board, location) pair with criteria-derived
+    params. Returns:
         (listings, board_status)
-    where board_status maps board_name -> "ok" or error message.
+    where board_status maps "<board>@<location>" -> "ok" or error message.
 
-    Per-board errors are caught and logged — the call always returns whatever
+    JobSpy takes one location per call, so we loop over locations × boards.
+    Per-pair errors are caught and logged — the call always returns whatever
     succeeded plus the status map. Caller logs partial-success in the brief.
     """
     from jobspy import scrape_jobs  # local import — heavy module
@@ -92,26 +94,33 @@ def fetch_all(criteria: dict, results_per_board: int = 50) -> tuple[list[dict], 
     search_terms = " OR ".join(f'"{r}"' for r in criteria.get("roles", []) if r)
     locations = criteria.get("locations", []) or [""]
 
+    # Cap per-pair results so total fetched is reasonable across all locations.
+    # 50 results per board × 5 boards × 4 locations = 1000 candidates; tighten
+    # when we have many locations to keep the daily fetch bounded.
+    per_pair = max(10, results_per_board // max(1, len(locations)))
+
     out: list[dict] = []
     status: dict[str, str] = {}
-    for board in ALL_BOARDS:
-        try:
-            df = scrape_jobs(
-                site_name=[board],
-                search_term=search_terms or None,
-                location=locations[0],  # JobSpy takes one location per call
-                results_wanted=results_per_board,
-                hours_old=72,  # only postings from the last 3 days
-                country_indeed="USA",
-            )
-            if df is None or df.empty:
-                status[board] = "ok (0 results)"
-                continue
-            for _, row in df.iterrows():
-                out.append(normalize_listing(row.to_dict()))
-            status[board] = "ok"
-        except Exception as e:
-            logger.exception("search.fetch_all: %s failed", board)
-            status[board] = f"error: {type(e).__name__}: {e}"
+    for location in locations:
+        for board in ALL_BOARDS:
+            key = f"{board}@{location}" if location else board
+            try:
+                df = scrape_jobs(
+                    site_name=[board],
+                    search_term=search_terms or None,
+                    location=location,
+                    results_wanted=per_pair,
+                    hours_old=72,  # only postings from the last 3 days
+                    country_indeed="USA",
+                )
+                if df is None or df.empty:
+                    status[key] = "ok (0 results)"
+                    continue
+                for _, row in df.iterrows():
+                    out.append(normalize_listing(row.to_dict()))
+                status[key] = "ok"
+            except Exception as e:
+                logger.exception("search.fetch_all: %s failed", key)
+                status[key] = f"error: {type(e).__name__}: {e}"
 
     return dedupe(out), status
