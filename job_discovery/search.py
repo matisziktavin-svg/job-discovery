@@ -27,7 +27,14 @@ def _is_real_number(v) -> bool:
 # Higher-quality sources first — used by dedupe() to pick a winner when the
 # same job appears on multiple boards.
 SOURCE_QUALITY_ORDER = ["linkedin", "indeed", "glassdoor", "google", "zip_recruiter"]
-ALL_BOARDS = list(SOURCE_QUALITY_ORDER)
+
+# Upstream JobSpy scrapers broken: Glassdoor's location lookup returns 400
+# (speedyapply/JobSpy#279) and ZipRecruiter is Cloudflare-blocked with stale
+# hardcoded device credentials (speedyapply/JobSpy#321). No working upstream
+# fix on PyPI 1.1.82. Re-enable a board by removing it from DISABLED_BOARDS
+# once upstream ships a fix (or we patch locally).
+DISABLED_BOARDS = {"glassdoor", "zip_recruiter"}
+ALL_BOARDS = [b for b in SOURCE_QUALITY_ORDER if b not in DISABLED_BOARDS]
 
 
 def normalize_listing(raw: dict) -> dict:
