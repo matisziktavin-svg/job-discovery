@@ -23,7 +23,7 @@ if (-not (Test-Path $VenvPy)) {
 # Build the action: cmd.exe so we can set the env var inline AND redirect
 # stdout/stderr. The double-quoting is intentional — cmd.exe needs double-
 # quotes around the python path because it has spaces.
-$ActionArgs = "/c set VAULT_PATH=$VaultPath && `"$VenvPy`" -m job_discovery.cli scan >> `"$LogPath`" 2>&1"
+$ActionArgs = "/c set `"VAULT_PATH=$VaultPath`" && `"$VenvPy`" -m job_discovery.cli scan >> `"$LogPath`" 2>&1"
 $Action = New-ScheduledTaskAction `
     -Execute "cmd.exe" `
     -Argument $ActionArgs `
