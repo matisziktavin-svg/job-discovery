@@ -95,8 +95,9 @@ def test_fetch_all_loops_over_all_locations(monkeypatch):
     }
     listings, status = search.fetch_all(criteria, results_per_board=20)
 
-    # 5 boards × 2 locations = 10 calls
-    assert len(calls) == 10
+    # len(ALL_BOARDS) × 2 locations calls (currently 3 boards × 2 = 6 with
+    # glassdoor + zip_recruiter disabled upstream; see search.DISABLED_BOARDS)
+    assert len(calls) == len(search.ALL_BOARDS) * 2
     locs_called = {c["loc"] for c in calls}
     assert locs_called == {"Chicago, IL", "Denver, CO"}
     boards_called = {c["site"] for c in calls}
