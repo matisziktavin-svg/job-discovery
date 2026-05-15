@@ -66,13 +66,28 @@ def _apply_hard_gates(listings: list[dict], criteria: dict) -> list[dict]:
     ]
 
 
+def _posted_date_sort_key(posted_date) -> int:
+    """Convert 'YYYY-MM-DD' to YYYYMMDD as int for sort tiebreaking.
+    Returns 0 for anything malformed/missing so a single bad value never
+    crashes the sort (Bug C regression guard — a NaN-derived "nan" string
+    from search.normalize_listing took the whole scan down at 3 AM).
+    """
+    if not isinstance(posted_date, str):
+        return 0
+    s = posted_date.replace("-", "")
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return 0
+
+
 def _select_top_n(scored: list[dict], n: int = 5, threshold: float = 3.0) -> list[dict]:
     """Sort by overall score descending, drop anything below threshold,
     cap at N. Ties broken by posted_date desc, then id asc for stability."""
     qualified = [m for m in scored if m["score"]["overall"] >= threshold]
     qualified.sort(key=lambda m: (
         -m["score"]["overall"],
-        -(int(m.get("posted_date", "0").replace("-", "") or 0)),
+        -_posted_date_sort_key(m.get("posted_date", "")),
         m.get("id", ""),
     ))
     return qualified[:n]
@@ -133,35 +148,52 @@ def cmd_scan(args: argparse.Namespace) -> int:
     logger.info("scan: %d fresh after dedupe vs surfaced+history", len(fresh))
 
     scored: list[dict] = []
+    skipped = 0
     for listing in fresh:
         if args.dry_run:
             print(f"[dry-run] would score: {listing['company']} — {listing['title']}")
             continue
-        result = score.score_listing(listing, criteria, preferences, profile_blob)
-        # Salary is a deterministic post-step (orchestrator-applied so both
-        # LLM and rule-based paths get the same treatment): missing salary
-        # gets flagged; below-floor gets soft-penalized 0.5.
-        result = score.apply_salary_penalty(result, listing, criteria)
-        match = {
-            "id": state.new_match_id(),
-            "source": listing["source"],
-            "title": listing["title"],
-            "company": listing["company"],
-            "location": listing["location"],
-            "salary": listing["salary"],
-            "url": listing["url"],
-            "posted_date": listing["posted_date"],
-            "surfaced_date": today,
-            "score": {
-                "overall": result["overall"],
-                "dims": result["dims"],
-                "method": result["method"],
-            },
-            "one_line_take": result["one_line_take"],
-            "status": "surfaced",
-            "times_carried": 0,
-        }
+        # Per-listing isolation: a single bad row (LLM crash, unexpected
+        # listing shape, salary-penalty bug) must not drop the whole batch.
+        # score_listing already has internal LLM-failure handling, but the
+        # outer match-dict assembly and apply_salary_penalty can still raise.
+        # Bug C regression guard: pre-fix, one bad listing aborted the whole
+        # scan and `state.save_matches()` never ran.
+        try:
+            result = score.score_listing(listing, criteria, preferences, profile_blob)
+            # Salary is a deterministic post-step (orchestrator-applied so both
+            # LLM and rule-based paths get the same treatment): missing salary
+            # gets flagged; below-floor gets soft-penalized 0.5.
+            result = score.apply_salary_penalty(result, listing, criteria)
+            match = {
+                "id": state.new_match_id(),
+                "source": listing["source"],
+                "title": listing["title"],
+                "company": listing["company"],
+                "location": listing["location"],
+                "salary": listing["salary"],
+                "url": listing["url"],
+                "posted_date": listing["posted_date"],
+                "surfaced_date": today,
+                "score": {
+                    "overall": result["overall"],
+                    "dims": result["dims"],
+                    "method": result["method"],
+                },
+                "one_line_take": result["one_line_take"],
+                "status": "surfaced",
+                "times_carried": 0,
+            }
+        except Exception:
+            skipped += 1
+            logger.exception(
+                "scan: scoring crashed for company=%r title=%r; skipping listing",
+                listing.get("company"), listing.get("title"),
+            )
+            continue
         scored.append(match)
+    if skipped:
+        logger.warning("scan: skipped %d listing(s) due to scoring errors", skipped)
 
     if args.dry_run:
         print(f"[dry-run] would have scored {len(fresh)} listings")

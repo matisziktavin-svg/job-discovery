@@ -192,6 +192,56 @@ def test_fetch_all_isolates_bad_listing_within_a_board(monkeypatch):
     assert status["indeed@Chicago, IL"] == "ok"
 
 
+def test_normalize_listing_handles_nan_posted_date():
+    """Bug C regression: JobSpy returns NaN (a truthy float) for missing
+    `date_posted`. Pre-fix, the strftime fallback caught AttributeError and
+    did `str(NaN)` → the literal string "nan", which then crashed `int()`
+    in cli._select_top_n's sort key at 3 AM and killed the whole scan
+    before state.save_matches() could write. Posted_date NaN must yield "".
+    """
+    nan = float("nan")
+    raw = {
+        "title": "Mech Eng", "company": "Acme", "location": "Chicago, IL",
+        "job_url": "https://example.com/1", "site": "indeed",
+        "date_posted": nan,
+    }
+    out = search.normalize_listing(raw)
+    assert out["posted_date"] == ""
+    assert out["posted_date"] != "nan"  # explicit guard against the historical bug
+
+
+def test_normalize_listing_handles_nan_string_fields():
+    """Bug C related: any string-typed JobSpy field could in principle be NaN
+    when the upstream DataFrame has a missing value. The naive
+    `(raw.get("field") or "").strip()` pattern crashed on NaN floats because
+    NaN is truthy. _safe_str must coerce NaN to "" before .strip()/.lower().
+    """
+    nan = float("nan")
+    raw = {
+        "title": nan, "company": nan, "location": nan,
+        "job_url": nan, "site": nan, "description": nan,
+    }
+    out = search.normalize_listing(raw)  # Must not raise
+    assert out["title"] == ""
+    assert out["company"] == ""
+    assert out["location"] == ""
+    assert out["url"] == ""
+    assert out["source"] == ""
+    assert out["description"] == ""
+
+
+def test_normalize_listing_handles_pandas_timestamp_posted_date():
+    """JobSpy can return pandas.Timestamp for date_posted. strftime path
+    must produce ISO format, not str() of the Timestamp."""
+    import pandas as pd
+    raw = {
+        "title": "T", "company": "X", "location": "L", "job_url": "u",
+        "site": "linkedin", "date_posted": pd.Timestamp("2026-05-12"),
+    }
+    out = search.normalize_listing(raw)
+    assert out["posted_date"] == "2026-05-12"
+
+
 def test_fetch_all_excludes_title_exclusions_from_search_terms(monkeypatch):
     """Bug A: criteria.title_exclusions must NOT be sent as search terms to
     JobSpy. Regression guard: earlier impl folded exclusions into roles, so

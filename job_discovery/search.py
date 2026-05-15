@@ -24,6 +24,26 @@ def _is_real_number(v) -> bool:
         return False
     return True
 
+
+def _safe_str(v) -> str:
+    """Coerce a JobSpy field to a clean string. None and NaN become "".
+    Non-string scalars are str()'d. Bug C regression guard: pandas returns
+    NaN (a truthy float) for missing string columns, so the naive
+    `(v or "").strip()` pattern crashed `.strip()` on float, and the
+    `str(NaN)` fallback for `date_posted` produced the literal string "nan"
+    which then crashed `int()` in cli._select_top_n's sort key.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float) and math.isnan(v):
+        return ""
+    if isinstance(v, str):
+        return v
+    try:
+        return str(v)
+    except Exception:
+        return ""
+
 # Higher-quality sources first — used by dedupe() to pick a winner when the
 # same job appears on multiple boards.
 SOURCE_QUALITY_ORDER = ["linkedin", "indeed", "glassdoor", "google", "zip_recruiter"]
@@ -47,23 +67,29 @@ def normalize_listing(raw: dict) -> dict:
     elif _is_real_number(mn):
         salary = f"${int(mn) // 1000}K+"
 
-    posted = raw.get("date_posted")
-    if posted is not None and not isinstance(posted, str):
+    posted_raw = raw.get("date_posted")
+    if posted_raw is None or (isinstance(posted_raw, float) and math.isnan(posted_raw)):
+        posted = ""
+    elif isinstance(posted_raw, str):
+        posted = posted_raw
+    else:
         # JobSpy may return a datetime or pandas Timestamp
         try:
-            posted = posted.strftime("%Y-%m-%d")
-        except AttributeError:
-            posted = str(posted)
+            posted = posted_raw.strftime("%Y-%m-%d")
+        except (AttributeError, TypeError, ValueError):
+            # Never fall back to str() — that turns NaN-likes into the literal
+            # string "nan" which then poisons downstream int() conversions.
+            posted = ""
 
     return {
-        "title": (raw.get("title") or "").strip(),
-        "company": (raw.get("company") or "").strip(),
-        "location": (raw.get("location") or "").strip(),
-        "url": raw.get("job_url") or raw.get("url") or "",
+        "title": _safe_str(raw.get("title")).strip(),
+        "company": _safe_str(raw.get("company")).strip(),
+        "location": _safe_str(raw.get("location")).strip(),
+        "url": _safe_str(raw.get("job_url")) or _safe_str(raw.get("url")),
         "salary": salary,
-        "posted_date": posted or "",
-        "source": (raw.get("site") or "").lower(),
-        "description": raw.get("description") or "",
+        "posted_date": posted,
+        "source": _safe_str(raw.get("site")).lower(),
+        "description": _safe_str(raw.get("description")),
     }
 
 

@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
-from job_discovery import cli, state, search
+from job_discovery import cli, score, state, search
 
 
 CRITERIA = {
@@ -66,6 +66,26 @@ def test_apply_hard_gates_warns_on_unrecognized_prefix(caplog):
     assert "Rural" in msgs
 
 
+def test_select_top_n_robust_against_malformed_posted_date():
+    """Bug C defense-in-depth: even if normalize_listing fails and a bad
+    posted_date slips through ('nan', empty string, None, missing key, or
+    an unparseable date), the sort must NOT crash. Bad-date items sort
+    to the end via tiebreak=0 instead of taking the whole scan down."""
+    scored = [
+        {"id": "a", "score": {"overall": 4.5}, "posted_date": "2026-05-14"},
+        {"id": "b", "score": {"overall": 4.5}, "posted_date": "nan"},  # the bug
+        {"id": "c", "score": {"overall": 4.5}, "posted_date": ""},
+        {"id": "d", "score": {"overall": 4.5}, "posted_date": None},
+        {"id": "e", "score": {"overall": 4.5}, "posted_date": "not-a-date"},
+        {"id": "f", "score": {"overall": 4.5}},  # missing key entirely
+    ]
+    top = cli._select_top_n(scored, n=10, threshold=3.0)  # must not raise
+    # All six items survive (they all clear the threshold); the well-formed
+    # date sorts first because its key is larger than 0.
+    assert {m["id"] for m in top} == {"a", "b", "c", "d", "e", "f"}
+    assert top[0]["id"] == "a"
+
+
 def test_select_top_n_respects_threshold_and_cap():
     scored = [
         {"id": "a", "score": {"overall": 4.2}},
@@ -79,6 +99,67 @@ def test_select_top_n_respects_threshold_and_cap():
     top = cli._select_top_n(scored, n=5, threshold=3.0)
     assert [m["id"] for m in top] == ["a", "d", "f", "b", "e"]
     assert all(m["score"]["overall"] >= 3.0 for m in top)
+
+
+def test_cmd_scan_isolates_per_listing_scoring_failure(tmp_path, monkeypatch, capsys):
+    """Bug C regression guard: one bad listing must not abort the whole scan.
+    Pre-fix, an uncaught exception in score_listing propagated up out of
+    cmd_scan, so state.save_matches() never ran and job_matches.json was
+    never written — exactly the failure mode that killed 2026-05-15's brief.
+    """
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True, exist_ok=True)
+    crit_path.write_text(
+        "# Job Search Criteria\n\n## Roles\n- Mech Eng\n\n"
+        "## Locations\n- Chicago, IL\n",
+        encoding="utf-8",
+    )
+
+    listings = [
+        {"title": "Good A", "company": "GoodA", "location": "Chicago, IL",
+         "url": "u1", "salary": "$80K-$100K", "posted_date": "2026-05-14",
+         "source": "linkedin", "description": "ok"},
+        {"title": "Bad B", "company": "BadB", "location": "Chicago, IL",
+         "url": "u2", "salary": "", "posted_date": "2026-05-14",
+         "source": "linkedin", "description": "ok"},
+        {"title": "Good C", "company": "GoodC", "location": "Chicago, IL",
+         "url": "u3", "salary": "$80K-$100K", "posted_date": "2026-05-14",
+         "source": "linkedin", "description": "ok"},
+    ]
+
+    monkeypatch.setattr(
+        search, "fetch_all",
+        lambda criteria, results_per_board=50: (listings, {"linkedin@Chicago, IL": "ok"}),
+    )
+
+    def fake_score_listing(listing, criteria, preferences, profile_blob, model=None):
+        if listing["company"] == "BadB":
+            raise RuntimeError("simulated scoring crash")
+        return {
+            "overall": 4.0,
+            "dims": {"role_fit": 4, "skills_match": 4, "seniority": 4,
+                     "domain": 4, "location": 4, "responsibilities": 4},
+            "one_line_take": "good fit",
+            "method": "llm",
+        }
+
+    monkeypatch.setattr(score, "score_listing", fake_score_listing)
+    monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
+
+    args = _Args(dry_run=False, top_n=5, threshold=3.0)
+    rc = cli.cmd_scan(args)
+
+    assert rc == 0
+
+    # Critical: state.save_matches() ran — the file exists with the two good
+    # listings and the bad one was skipped.
+    matches = state.load_matches()
+    companies = {m["company"] for m in matches}
+    assert "GoodA" in companies
+    assert "GoodC" in companies
+    assert "BadB" not in companies
 
 
 def test_merge_with_carryforward_preserves_unactioned_old_matches(tmp_path, monkeypatch):
