@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
-from job_discovery import cli, score, state, search
+from job_discovery import cli, score, state, search, fetch_jd
 
 
 CRITERIA = {
@@ -319,3 +319,159 @@ def test_cmd_record_action_applied_failure_in_append_does_not_corrupt_state(
     assert items[0]["status"] == "surfaced"  # NOT "applied"
     assert "action_date" not in items[0]
     assert state.load_history() == []
+
+
+# -----------------------------------------------------------------------------
+# Hybrid JD-recovery gate in cmd_scan
+# -----------------------------------------------------------------------------
+
+
+def _write_criteria(tmp_path):
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True, exist_ok=True)
+    crit_path.write_text(
+        "# Job Search Criteria\n\n## Roles\n- Mech Eng\n\n"
+        "## Locations\n- Chicago, IL\n",
+        encoding="utf-8",
+    )
+
+
+def _gate_listing(url, description=""):
+    return {
+        "title": "Mechanical Design Engineer", "company": "Akkodis",
+        "location": "Denver, CO", "url": url, "salary": "$80K-$100K",
+        "posted_date": "2026-05-16", "source": "linkedin",
+        "description": description,
+    }
+
+
+def test_cmd_scan_gate_recovers_jd_and_rescores(tmp_path, monkeypatch):
+    """No description + blind score >4 → WebFetch fires, listing is rescored
+    on the recovered JD (here the rescore correctly drops it)."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    _write_criteria(tmp_path)
+    listing = _gate_listing("https://linkedin.com/jobs/view/1")
+    monkeypatch.setattr(
+        search, "fetch_all",
+        lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
+    )
+
+    calls = {"score": 0}
+
+    def fake_score_listing(l, c, p, b, model=None):
+        calls["score"] += 1
+        if l.get("description"):  # rescore on recovered JD → correct (low)
+            return {"overall": 2.5, "dims": {"role_fit": 2, "skills_match": 2,
+                    "seniority": 2, "domain": 2, "location": 2,
+                    "responsibilities": 2},
+                    "one_line_take": "senior, not a fit", "method": "llm"}
+        return {"overall": 4.3, "dims": {"role_fit": 5, "skills_match": 4,
+                "seniority": 5, "domain": 4, "location": 4,
+                "responsibilities": 4},
+                "one_line_take": "looks great", "method": "llm"}
+
+    monkeypatch.setattr(score, "score_listing", fake_score_listing)
+    monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
+
+    fetch_calls = []
+    monkeypatch.setattr(
+        fetch_jd, "fetch_job_description",
+        lambda url, timeout_s=45.0: (fetch_calls.append(url)
+                                     or "7-15 yrs, senior missile defense."),
+    )
+
+    rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
+    assert rc == 0
+    assert fetch_calls == ["https://linkedin.com/jobs/view/1"]
+    assert calls["score"] == 2  # blind score + rescore
+    assert state.load_matches() == []  # rescored 2.5 < 3.0 → not surfaced
+
+
+def test_cmd_scan_gate_penalizes_when_fetch_fails(tmp_path, monkeypatch):
+    """No description + blind score >4 + WebFetch returns None →
+    apply_unverified_penalty: -0.5 and flagged, still surfaced."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    _write_criteria(tmp_path)
+    listing = _gate_listing("https://linkedin.com/jobs/view/2")
+    monkeypatch.setattr(
+        search, "fetch_all",
+        lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
+    )
+    monkeypatch.setattr(
+        score, "score_listing",
+        lambda l, c, p, b, model=None: {
+            "overall": 4.4, "dims": {"role_fit": 5, "skills_match": 4,
+            "seniority": 5, "domain": 4, "location": 4,
+            "responsibilities": 4},
+            "one_line_take": "looks great", "method": "llm"},
+    )
+    monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
+    monkeypatch.setattr(
+        fetch_jd, "fetch_job_description", lambda url, timeout_s=45.0: None
+    )
+
+    rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
+    assert rc == 0
+    matches = state.load_matches()
+    assert len(matches) == 1
+    assert matches[0]["score"]["overall"] == 3.9  # 4.4 - 0.5
+    assert "unverified" in matches[0]["one_line_take"].lower()
+
+
+def test_cmd_scan_gate_skips_when_description_present(tmp_path, monkeypatch):
+    """Has a description → gate never fires even if score >4."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    _write_criteria(tmp_path)
+    listing = _gate_listing("u", description="Full real description here.")
+    monkeypatch.setattr(
+        search, "fetch_all",
+        lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
+    )
+    monkeypatch.setattr(
+        score, "score_listing",
+        lambda l, c, p, b, model=None: {
+            "overall": 4.6, "dims": {"role_fit": 5, "skills_match": 5,
+            "seniority": 4, "domain": 4, "location": 5,
+            "responsibilities": 4},
+            "one_line_take": "great", "method": "llm"},
+    )
+    monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
+    called = []
+    monkeypatch.setattr(
+        fetch_jd, "fetch_job_description",
+        lambda url, timeout_s=45.0: called.append(url),
+    )
+
+    rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
+    assert rc == 0
+    assert called == []  # description present → no fetch
+
+
+def test_cmd_scan_gate_skips_when_score_not_above_4(tmp_path, monkeypatch):
+    """No description but score is exactly 4.0 (not >4.0) → gate must NOT
+    fire. Verifies the strict > boundary."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    _write_criteria(tmp_path)
+    listing = _gate_listing("u")
+    monkeypatch.setattr(
+        search, "fetch_all",
+        lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
+    )
+    monkeypatch.setattr(
+        score, "score_listing",
+        lambda l, c, p, b, model=None: {
+            "overall": 4.0, "dims": {"role_fit": 4, "skills_match": 4,
+            "seniority": 4, "domain": 4, "location": 4,
+            "responsibilities": 4},
+            "one_line_take": "ok", "method": "llm"},
+    )
+    monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
+    called = []
+    monkeypatch.setattr(
+        fetch_jd, "fetch_job_description",
+        lambda url, timeout_s=45.0: called.append(url),
+    )
+
+    rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
+    assert rc == 0
+    assert called == []  # 4.0 is not > 4.0 → no fetch

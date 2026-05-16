@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-from job_discovery import score, search, state
+from job_discovery import fetch_jd, score, search, state
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
         # scan and `state.save_matches()` never ran.
         try:
             result = score.score_listing(listing, criteria, preferences, profile_blob)
+            # Hybrid JD recovery: a no-description listing that still scored
+            # >4 is suspect — unknown dims (esp. seniority) defaulted high.
+            # Spend a WebFetch to recover the real JD and rescore. If the
+            # fetch also fails, soft-downrank + flag rather than trust the
+            # blind score or silently drop a wall-blocked posting.
+            if (not (listing.get("description") or "").strip()
+                    and result["overall"] > 4.0):
+                jd = fetch_jd.fetch_job_description(listing["url"])
+                if jd:
+                    listing["description"] = jd
+                    result = score.score_listing(
+                        listing, criteria, preferences, profile_blob
+                    )
+                else:
+                    result = score.apply_unverified_penalty(result)
             # Salary is a deterministic post-step (orchestrator-applied so both
             # LLM and rule-based paths get the same treatment): missing salary
             # gets flagged; below-floor gets soft-penalized 0.5.
