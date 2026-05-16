@@ -273,6 +273,28 @@ def apply_salary_penalty(score_result: dict, listing: dict, criteria: dict) -> d
     return out
 
 
+def apply_unverified_penalty(score_result: dict) -> dict:
+    """Soft penalty for a high blind-default score we could not verify.
+
+    Triggered when a listing had no scraped description AND scored >4.0 on
+    blind defaults AND the WebFetch JD recovery also came back empty. The
+    high score is suspect (unknown dims — esp. seniority — defaulted high),
+    so downrank it off the top of the brief without dropping it.
+
+    Mirrors apply_salary_penalty: returns a NEW dict, does not mutate.
+      - overall reduced by 0.5 (clamped to 1.0 min)
+      - append the unverified flag to one_line_take (idempotent), capped 200
+    """
+    out = {**score_result, "dims": dict(score_result.get("dims", {}))}
+    take = (out.get("one_line_take") or "").strip()
+    out["overall"] = max(1.0, round(out.get("overall", 0.0) - 0.5, 1))
+    flag = "⚠ unverified — JD unreadable"
+    if flag not in take:
+        take = (take + " — " + flag) if take else flag
+        out["one_line_take"] = take[:200]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # LLM-based scoring (primary path)
 # ---------------------------------------------------------------------------

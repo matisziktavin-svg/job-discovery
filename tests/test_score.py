@@ -218,3 +218,33 @@ def test_apply_salary_penalty_does_not_mutate_input():
     score.apply_salary_penalty(original, listing, criteria)
     assert original["overall"] == 4.0
     assert "below floor" not in original["one_line_take"]
+
+
+# -----------------------------------------------------------------------------
+# Unverified-JD handling: high blind score we could not verify gets soft-
+# downranked + flagged (mirrors the salary penalty contract).
+# -----------------------------------------------------------------------------
+
+
+def test_apply_unverified_penalty_reduces_overall_and_flags():
+    result = score.apply_unverified_penalty(_mk_score_result(4.3))
+    assert result["overall"] == 3.8
+    assert "unverified" in result["one_line_take"].lower()
+
+
+def test_apply_unverified_penalty_clamps_at_1():
+    result = score.apply_unverified_penalty(_mk_score_result(1.2))
+    assert result["overall"] == 1.0
+
+
+def test_apply_unverified_penalty_flag_not_double_appended():
+    once = score.apply_unverified_penalty(_mk_score_result(4.3))
+    twice = score.apply_unverified_penalty(once)
+    assert twice["one_line_take"].lower().count("unverified") == 1
+
+
+def test_apply_unverified_penalty_does_not_mutate_input():
+    original = _mk_score_result(4.3)
+    score.apply_unverified_penalty(original)
+    assert original["overall"] == 4.3
+    assert "unverified" not in original["one_line_take"].lower()
