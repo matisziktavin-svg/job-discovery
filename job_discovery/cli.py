@@ -141,11 +141,20 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     gated = _apply_hard_gates(raw, criteria)
 
-    # Dedupe against currently surfaced + history
+    # Dedupe against currently surfaced + applied/passed history + the
+    # rolling "ever scored" cache. Without scored_history the same listing
+    # gets re-scored every night it stays inside hours_old=72 (~3× waste).
     surfaced_keys = {search.dedupe_key(m) for m in state.load_matches()}
     history_keys = {search.dedupe_key(m) for m in state.load_history()}
-    fresh = search.filter_unseen(gated, surfaced_keys | history_keys)
-    logger.info("scan: %d fresh after dedupe vs surfaced+history", len(fresh))
+    scored_keys = {e["key"] for e in state.load_scored_history() if e.get("key")}
+    fresh = search.filter_unseen(
+        gated, surfaced_keys | history_keys | scored_keys
+    )
+    logger.info(
+        "scan: %d fresh after dedupe vs surfaced+history+scored_cache "
+        "(surfaced=%d history=%d scored_cache=%d)",
+        len(fresh), len(surfaced_keys), len(history_keys), len(scored_keys),
+    )
 
     scored: list[dict] = []
     skipped = 0
@@ -218,10 +227,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
     merged = _merge_with_carryforward(top, today)
     state.save_matches(merged)
 
+    # Record every scored listing in the rolling cache so tomorrow's scan
+    # doesn't re-evaluate them. Fresh-but-skipped (scoring error) listings
+    # are intentionally NOT cached — they get a retry tomorrow.
+    state.append_scored_keys(
+        [search.dedupe_key(m) for m in scored],
+        today,
+    )
+
     print(json.dumps({
         "fresh_scored": len(scored),
         "top_n_surfaced": len(top),
         "total_active": len(merged),
+        "scored_history_size": len(state.load_scored_history()),
         "board_status": board_status,
     }, indent=2))
     return 0
@@ -343,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
     p_scan = sub.add_parser("scan", help="run the daily pipeline")
     p_scan.add_argument("--dry-run", action="store_true",
                         help="fetch + dedupe but skip scoring + state writes")
-    p_scan.add_argument("--top-n", type=int, default=5)
+    p_scan.add_argument("--top-n", type=int, default=3)
     p_scan.add_argument("--threshold", type=float, default=3.0)
     p_scan.set_defaults(func=cmd_scan)
 

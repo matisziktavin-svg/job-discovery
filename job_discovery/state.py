@@ -7,6 +7,7 @@ Mirrors Mizzix's follow_ups.py patterns:
 
 VAULT_PATH env var must point at the Second Brain vault root.
 """
+import datetime as dt
 import json
 import logging
 import os
@@ -27,6 +28,10 @@ def _matches_path() -> Path:
 
 def _history_path() -> Path:
     return _vault() / ".mizzix_state" / "job_matches_history.json"
+
+
+def _scored_history_path() -> Path:
+    return _vault() / ".mizzix_state" / "job_scored_history.json"
 
 
 def new_match_id() -> str:
@@ -65,6 +70,47 @@ def load_history() -> list[dict]:
 
 def save_history(items: list[dict]) -> None:
     _save(_history_path(), items)
+
+
+# Separate from history (which is "ever applied / passed") because this is
+# the much-larger "ever scored" cache — keeping them apart means
+# job_scored_history can be wiped to force a re-evaluation without nuking
+# the applications log. Bounded by RETAIN_DAYS so re-listed jobs eventually
+# get a second look.
+SCORED_HISTORY_RETAIN_DAYS = 14
+
+
+def load_scored_history() -> list[dict]:
+    return _load(_scored_history_path())
+
+
+def save_scored_history(items: list[dict]) -> None:
+    _save(_scored_history_path(), items)
+
+
+def append_scored_keys(
+    keys: list[str],
+    today: str,
+    *,
+    retain_days: int = SCORED_HISTORY_RETAIN_DAYS,
+) -> None:
+    """Append today's dedupe keys to scored_history and trim entries older
+    than retain_days. No-op on empty keys. Idempotent within a day: re-running
+    a scan that produced the same keys won't duplicate."""
+    if not keys:
+        return
+    cutoff = (dt.date.fromisoformat(today)
+              - dt.timedelta(days=retain_days)).isoformat()
+    existing = load_scored_history()
+    # Idempotency: drop any prior entry for today with a key we're re-adding.
+    today_new = set(keys)
+    kept = [
+        e for e in existing
+        if e.get("scored_date", "") >= cutoff
+        and not (e.get("scored_date") == today and e.get("key") in today_new)
+    ]
+    kept.extend({"key": k, "scored_date": today} for k in keys)
+    save_scored_history(kept)
 
 
 _PASS_REASON_RE = re.compile(

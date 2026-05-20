@@ -51,6 +51,57 @@ def test_new_match_id_format():
     assert len(mid) == 11  # "jm_" + 8 hex chars
 
 
+def test_load_scored_history_empty_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    assert state.load_scored_history() == []
+
+
+def test_append_scored_keys_writes_today_with_date(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_keys(["acme|mech eng|chicago, il"], "2026-05-20")
+    items = state.load_scored_history()
+    assert items == [{"key": "acme|mech eng|chicago, il", "scored_date": "2026-05-20"}]
+
+
+def test_append_scored_keys_noop_on_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_keys([], "2026-05-20")
+    # File should not exist — no-op means no write
+    assert not (tmp_path / ".mizzix_state" / "job_scored_history.json").exists()
+
+
+def test_append_scored_keys_trims_entries_older_than_retain_days(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.save_scored_history([
+        {"key": "old|job|loc", "scored_date": "2026-04-01"},     # >14 days old
+        {"key": "recent|job|loc", "scored_date": "2026-05-10"},  # within window
+    ])
+    state.append_scored_keys(["new|job|loc"], "2026-05-20")
+    items = state.load_scored_history()
+    keys = {e["key"] for e in items}
+    assert "old|job|loc" not in keys
+    assert "recent|job|loc" in keys
+    assert "new|job|loc" in keys
+
+
+def test_append_scored_keys_idempotent_within_a_day(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_keys(["acme|mech eng|chicago, il"], "2026-05-20")
+    state.append_scored_keys(["acme|mech eng|chicago, il"], "2026-05-20")
+    items = state.load_scored_history()
+    assert len(items) == 1
+
+
+def test_append_scored_keys_preserves_yesterdays_same_key(tmp_path, monkeypatch):
+    """A job scored yesterday and re-scored today (shouldn't normally happen
+    once dedupe is wired, but defensively) keeps a record per day."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_keys(["acme|mech eng|chicago, il"], "2026-05-19")
+    state.append_scored_keys(["acme|mech eng|chicago, il"], "2026-05-20")
+    items = state.load_scored_history()
+    assert {e["scored_date"] for e in items} == {"2026-05-19", "2026-05-20"}
+
+
 CRITERIA_FIXTURE = """\
 # Job Search Criteria
 
