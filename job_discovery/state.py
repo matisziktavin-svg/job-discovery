@@ -15,6 +15,13 @@ import re
 import secrets
 from pathlib import Path
 
+from job_discovery.types import (
+    Criteria,
+    Match,
+    Preferences,
+    ScoredHistoryEntry,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,20 +63,20 @@ def _save(path: Path, items: list[dict]) -> None:
     tmp.replace(path)
 
 
-def load_matches() -> list[dict]:
-    return _load(_matches_path())
+def load_matches() -> list[Match]:
+    return _load(_matches_path())  # type: ignore[return-value]
 
 
-def save_matches(items: list[dict]) -> None:
-    _save(_matches_path(), items)
+def save_matches(items: list[Match]) -> None:
+    _save(_matches_path(), items)  # type: ignore[arg-type]
 
 
-def load_history() -> list[dict]:
-    return _load(_history_path())
+def load_history() -> list[Match]:
+    return _load(_history_path())  # type: ignore[return-value]
 
 
-def save_history(items: list[dict]) -> None:
-    _save(_history_path(), items)
+def save_history(items: list[Match]) -> None:
+    _save(_history_path(), items)  # type: ignore[arg-type]
 
 
 # Separate from history (which is "ever applied / passed") because this is
@@ -80,12 +87,12 @@ def save_history(items: list[dict]) -> None:
 SCORED_HISTORY_RETAIN_DAYS = 14
 
 
-def load_scored_history() -> list[dict]:
-    return _load(_scored_history_path())
+def load_scored_history() -> list[ScoredHistoryEntry]:
+    return _load(_scored_history_path())  # type: ignore[return-value]
 
 
-def save_scored_history(items: list[dict]) -> None:
-    _save(_scored_history_path(), items)
+def save_scored_history(items: list[ScoredHistoryEntry]) -> None:
+    _save(_scored_history_path(), items)  # type: ignore[arg-type]
 
 
 def append_scored_keys(
@@ -166,7 +173,7 @@ def _bullet_lines(body: str) -> list[str]:
     return out
 
 
-def _split_h3_subsections(body: str) -> list[tuple[str, str]]:
+def _split_h3_subsections(body: str) -> list[tuple[str | None, str]]:
     """Split an H2 section's body into [(h3_heading_or_None, sub_body), ...].
 
     Returned in document order. The first element's heading is None if the
@@ -195,7 +202,7 @@ def _is_exclusion_h3(heading: str | None) -> bool:
     return any(pat in h for pat in _EXCLUSION_H3_PATTERNS)
 
 
-def read_criteria() -> dict:
+def read_criteria() -> Criteria:
     """Parse criteria.md into a structured dict.
 
     Empty defaults if file missing — caller (cli.py scan) treats empty
@@ -213,7 +220,7 @@ def read_criteria() -> dict:
         written under ## Locations) are silently dropped.
     """
     path = _criteria_path()
-    empty = {
+    empty: Criteria = {
         "roles": [],
         "locations": [],
         "title_exclusions": [],
@@ -231,7 +238,7 @@ def read_criteria() -> dict:
         return empty
 
     sections = _split_sections(text)
-    out = dict(empty)
+    out: Criteria = dict(empty)  # type: ignore[assignment]
 
     # Roles: split by H3, route exclusion sub-sections separately.
     roles: list[str] = []
@@ -279,7 +286,7 @@ def read_criteria() -> dict:
     return out
 
 
-def read_preferences() -> dict:
+def read_preferences() -> Preferences:
     """Parse preferences.md. Returns:
         {
           "learned_patterns": str (raw markdown body of ## Learned patterns),
@@ -288,7 +295,7 @@ def read_preferences() -> dict:
         }
     """
     path = _preferences_path()
-    empty = {"learned_patterns": "", "recent_pass_reasons": []}
+    empty: Preferences = {"learned_patterns": "", "recent_pass_reasons": []}
     if not path.exists():
         return empty
     try:
@@ -305,7 +312,7 @@ def read_preferences() -> dict:
         for m in _PASS_REASON_RE.finditer(raw_section)
     ]
     reasons.sort(key=lambda r: r["date"], reverse=True)
-    return {"learned_patterns": learned, "recent_pass_reasons": reasons}
+    return {"learned_patterns": learned, "recent_pass_reasons": reasons}  # type: ignore[typeddict-item]
 
 
 _PREFERENCES_TEMPLATE = """\

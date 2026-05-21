@@ -13,8 +13,10 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from job_discovery import fetch_jd, score, search, state
+from job_discovery.types import Criteria, Listing, Match
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,7 @@ def _load_profile_blob() -> str:
     return "\n\n".join(parts)
 
 
-def _apply_hard_gates(listings: list[dict], criteria: dict) -> list[dict]:
+def _apply_hard_gates(listings: list[Listing], criteria: Criteria) -> list[Listing]:
     """Drop any listing matching a hard gate. Currently supported:
         company:<name>     — exact company match (case-insensitive)
 
@@ -61,12 +63,12 @@ def _apply_hard_gates(listings: list[dict], criteria: dict) -> list[dict]:
                 g,
             )
     return [
-        l for l in listings
-        if (l.get("company") or "").strip().lower() not in blocked_companies
+        item for item in listings
+        if (item.get("company") or "").strip().lower() not in blocked_companies
     ]
 
 
-def _posted_date_sort_key(posted_date) -> int:
+def _posted_date_sort_key(posted_date: Any) -> int:
     """Convert 'YYYY-MM-DD' to YYYYMMDD as int for sort tiebreaking.
     Returns 0 for anything malformed/missing so a single bad value never
     crashes the sort (Bug C regression guard — a NaN-derived "nan" string
@@ -81,7 +83,9 @@ def _posted_date_sort_key(posted_date) -> int:
         return 0
 
 
-def _select_top_n(scored: list[dict], n: int = 5, threshold: float = 3.0) -> list[dict]:
+def _select_top_n(
+    scored: list[Match], n: int = 5, threshold: float = 3.0,
+) -> list[Match]:
     """Sort by overall score descending, drop anything below threshold,
     cap at N. Ties broken by posted_date desc, then id asc for stability."""
     qualified = [m for m in scored if m["score"]["overall"] >= threshold]
@@ -93,12 +97,14 @@ def _select_top_n(scored: list[dict], n: int = 5, threshold: float = 3.0) -> lis
     return qualified[:n]
 
 
-def _merge_with_carryforward(new_matches: list[dict], today_iso: str) -> list[dict]:
+def _merge_with_carryforward(
+    new_matches: list[Match], today_iso: str,
+) -> list[Match]:
     """Merge freshly scored matches into the existing job_matches.json,
     incrementing times_carried for items already present."""
     existing = state.load_matches()
     new_ids = {m["id"] for m in new_matches}
-    out: list[dict] = []
+    out: list[Match] = []
     for old in existing:
         if old.get("status") != "surfaced":
             continue
@@ -128,6 +134,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
     preferences = state.read_preferences()
     profile_blob = _load_profile_blob()
 
+    # Write the combined system prompt (rules + profile + criteria) ONCE so
+    # all per-listing LLM calls reference the same stable file path and
+    # benefit from Claude Code's prompt cache. Without this, the prefix is
+    # rebuilt and resent per call, burning the daily Sonnet window in <2h.
+    scoring_system_prompt_path = score.write_scoring_system_prompt(
+        criteria, preferences, profile_blob,
+    )
+
     today = _today_iso()
     logger.info("scan: starting (criteria roles=%d, locations=%d)",
                 len(criteria["roles"]), len(criteria["locations"]))
@@ -156,7 +170,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         len(fresh), len(surfaced_keys), len(history_keys), len(scored_keys),
     )
 
-    scored: list[dict] = []
+    scored: list[Match] = []
     skipped = 0
     for listing in fresh:
         if args.dry_run:
@@ -169,7 +183,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
         # Bug C regression guard: pre-fix, one bad listing aborted the whole
         # scan and `state.save_matches()` never ran.
         try:
-            result = score.score_listing(listing, criteria, preferences, profile_blob)
+            result = score.score_listing(
+                listing, criteria, preferences, profile_blob,
+                system_prompt_path=scoring_system_prompt_path,
+            )
             # Hybrid JD recovery: a no-description listing that still scored
             # >4 is suspect — unknown dims (esp. seniority) defaulted high.
             # Spend a WebFetch to recover the real JD and rescore. If the
@@ -181,7 +198,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 if jd:
                     listing["description"] = jd
                     result = score.score_listing(
-                        listing, criteria, preferences, profile_blob
+                        listing, criteria, preferences, profile_blob,
+                        system_prompt_path=scoring_system_prompt_path,
                     )
                 else:
                     result = score.apply_unverified_penalty(result)
@@ -189,7 +207,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             # LLM and rule-based paths get the same treatment): missing salary
             # gets flagged; below-floor gets soft-penalized 0.5.
             result = score.apply_salary_penalty(result, listing, criteria)
-            match = {
+            match: Match = {
                 "id": state.new_match_id(),
                 "source": listing["source"],
                 "title": listing["title"],
@@ -207,6 +225,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 "one_line_take": result["one_line_take"],
                 "status": "surfaced",
                 "times_carried": 0,
+                "last_brief_date": "",
             }
         except Exception:
             skipped += 1
@@ -274,7 +293,7 @@ def cmd_score_one(args: argparse.Namespace) -> int:
     if not args.description:
         print("score-one requires --description (paste the JD text).", file=sys.stderr)
         return 1
-    listing = {
+    listing: Listing = {
         "title": args.title or "(unknown title)",
         "company": args.company or "(unknown company)",
         "location": args.location or "",

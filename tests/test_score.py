@@ -65,23 +65,36 @@ def test_rule_score_one_line_take_includes_signals():
     assert len(result["one_line_take"]) <= 200
 
 
-def test_assemble_scoring_user_prompt_includes_listing_and_context():
+def test_assemble_scoring_user_prompt_includes_only_listing():
+    """Post-refactor: the user prompt carries ONLY the per-listing payload.
+    Static context (criteria, preferences, profile) lives in the system
+    prompt so it hits the prompt cache."""
     listing = {
         "title": "Mech Eng", "company": "Acme", "location": "Chicago",
         "description": "Design things.", "salary": "$80K",
     }
+    prompt = score._assemble_user_prompt(listing)
+    assert "Mech Eng" in prompt
+    assert "Acme" in prompt
+    assert "Design things" in prompt
+
+
+def test_assemble_scoring_system_prompt_includes_context():
+    """The system prompt carries criteria + preferences + profile so the
+    cached prefix covers the parts that don't change per listing."""
     criteria = {"roles": ["Mech Eng"], "locations": ["Chicago, IL"], "weights": {}}
     preferences = {
         "learned_patterns": "Skip defense",
         "recent_pass_reasons": [{"date": "2026-05-10", "text": "too senior"}],
     }
     profile_blob = "Tavin: aerospace eng, mid-IC."
-    prompt = score._assemble_user_prompt(listing, criteria, preferences, profile_blob)
-    assert "Mech Eng" in prompt
-    assert "Acme" in prompt
-    assert "Skip defense" in prompt
-    assert "too senior" in prompt
-    assert "aerospace eng" in prompt
+    system_prompt = score._assemble_system_prompt(
+        "BASE_RULES_HERE", criteria, preferences, profile_blob,
+    )
+    assert "BASE_RULES_HERE" in system_prompt
+    assert "Skip defense" in system_prompt
+    assert "too senior" in system_prompt
+    assert "aerospace eng" in system_prompt
 
 
 def test_rule_score_respects_title_exclusions():
@@ -99,21 +112,20 @@ def test_rule_score_respects_title_exclusions():
     assert result["dims"]["role_fit"] == 1
 
 
-def test_assemble_scoring_user_prompt_includes_title_exclusions():
+def test_assemble_scoring_system_prompt_includes_title_exclusions():
     """Bug A wiring: title_exclusions must reach the LLM scorer so it can
-    enforce role_fit=1 for excluded titles."""
-    listing = {"title": "T", "company": "C", "location": "L",
-               "description": "d", "salary": ""}
+    enforce role_fit=1 for excluded titles. Post-refactor these live in
+    the system prompt (cached), not the per-listing user prompt."""
     criteria = {
         "roles": ["Mech Eng"],
         "title_exclusions": ["Senior", "Manager"],
         "locations": ["Chicago, IL"],
         "weights": {},
     }
-    prompt = score._assemble_user_prompt(listing, criteria, {}, "")
-    assert '"title_exclusions"' in prompt
-    assert '"Senior"' in prompt
-    assert '"Manager"' in prompt
+    system_prompt = score._assemble_system_prompt("BASE", criteria, {}, "")
+    assert '"title_exclusions"' in system_prompt
+    assert '"Senior"' in system_prompt
+    assert '"Manager"' in system_prompt
 
 
 def test_parse_score_response_valid_json():

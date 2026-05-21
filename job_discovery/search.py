@@ -5,12 +5,14 @@ for logging which boards succeeded.
 """
 import logging
 import math
-from typing import Iterable
+from typing import Any, Iterable, Mapping
+
+from job_discovery.types import Criteria, Listing
 
 logger = logging.getLogger(__name__)
 
 
-def _is_real_number(v) -> bool:
+def _is_real_number(v: Any) -> bool:
     """True iff `v` is a number that's safely convertible to int.
     Filters None and pandas/numpy NaN (which is a float, so `is not None` is
     True but `int(nan)` raises ValueError).
@@ -25,7 +27,7 @@ def _is_real_number(v) -> bool:
     return True
 
 
-def _safe_str(v) -> str:
+def _safe_str(v: Any) -> str:
     """Coerce a JobSpy field to a clean string. None and NaN become "".
     Non-string scalars are str()'d. Bug C regression guard: pandas returns
     NaN (a truthy float) for missing string columns, so the naive
@@ -57,15 +59,15 @@ DISABLED_BOARDS = {"glassdoor", "zip_recruiter"}
 ALL_BOARDS = [b for b in SOURCE_QUALITY_ORDER if b not in DISABLED_BOARDS]
 
 
-def normalize_listing(raw: dict) -> dict:
+def normalize_listing(raw: dict[str, Any]) -> Listing:
     """Map a JobSpy row (or any board's raw output) to our match schema."""
     salary = ""
     mn = raw.get("min_amount")
     mx = raw.get("max_amount")
     if _is_real_number(mn) and _is_real_number(mx):
-        salary = f"${int(mn) // 1000}K-${int(mx) // 1000}K"
+        salary = f"${int(mn) // 1000}K-${int(mx) // 1000}K"  # type: ignore[arg-type]
     elif _is_real_number(mn):
-        salary = f"${int(mn) // 1000}K+"
+        salary = f"${int(mn) // 1000}K+"  # type: ignore[arg-type]
 
     posted_raw = raw.get("date_posted")
     if posted_raw is None or (isinstance(posted_raw, float) and math.isnan(posted_raw)):
@@ -93,8 +95,13 @@ def normalize_listing(raw: dict) -> dict:
     }
 
 
-def dedupe_key(listing: dict) -> str:
-    """Normalized key for deduping the same job across boards."""
+def dedupe_key(listing: Mapping[str, Any]) -> str:
+    """Normalized key for deduping the same job across boards.
+
+    Accepts either a `Listing` (pre-scoring, from search) or a `Match`
+    (post-scoring, from state) — both expose the company/title/location
+    fields this key needs.
+    """
     return "|".join([
         (listing.get("company") or "").strip().lower(),
         (listing.get("title") or "").strip().lower(),
@@ -109,11 +116,11 @@ def _source_rank(source: str) -> int:
         return len(SOURCE_QUALITY_ORDER)  # unknown source ranks last
 
 
-def dedupe(listings: list[dict]) -> list[dict]:
+def dedupe(listings: list[Listing]) -> list[Listing]:
     """Collapse duplicates across boards. For each dedupe key, keep the
     listing from the highest-quality source.
     """
-    by_key: dict[str, dict] = {}
+    by_key: dict[str, Listing] = {}
     for it in listings:
         k = dedupe_key(it)
         existing = by_key.get(k)
@@ -122,13 +129,15 @@ def dedupe(listings: list[dict]) -> list[dict]:
     return list(by_key.values())
 
 
-def filter_unseen(listings: list[dict], seen_keys: Iterable[str]) -> list[dict]:
+def filter_unseen(listings: list[Listing], seen_keys: Iterable[str]) -> list[Listing]:
     """Drop listings whose dedupe_key is in `seen_keys`."""
     seen = set(seen_keys)
     return [it for it in listings if dedupe_key(it) not in seen]
 
 
-def fetch_all(criteria: dict, results_per_board: int = 50) -> tuple[list[dict], dict[str, str]]:
+def fetch_all(
+    criteria: Criteria, results_per_board: int = 50,
+) -> tuple[list[Listing], dict[str, str]]:
     """Run JobSpy against each (board, location) pair with criteria-derived
     params. Returns:
         (listings, board_status)
@@ -148,7 +157,7 @@ def fetch_all(criteria: dict, results_per_board: int = 50) -> tuple[list[dict], 
     # when we have many locations to keep the daily fetch bounded.
     per_pair = max(10, results_per_board // max(1, len(locations)))
 
-    out: list[dict] = []
+    out: list[Listing] = []
     status: dict[str, str] = {}
     for location in locations:
         for board in ALL_BOARDS:

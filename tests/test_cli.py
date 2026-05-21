@@ -134,7 +134,8 @@ def test_cmd_scan_isolates_per_listing_scoring_failure(tmp_path, monkeypatch, ca
         lambda criteria, results_per_board=50: (listings, {"linkedin@Chicago, IL": "ok"}),
     )
 
-    def fake_score_listing(listing, criteria, preferences, profile_blob, model=None):
+    def fake_score_listing(listing, criteria, preferences, profile_blob,
+                           *, system_prompt_path=None, model=None):
         if listing["company"] == "BadB":
             raise RuntimeError("simulated scoring crash")
         return {
@@ -358,7 +359,7 @@ def test_cmd_scan_gate_recovers_jd_and_rescores(tmp_path, monkeypatch):
 
     calls = {"score": 0}
 
-    def fake_score_listing(l, c, p, b, model=None):
+    def fake_score_listing(l, c, p, b, *, system_prompt_path=None, model=None):
         calls["score"] += 1
         if l.get("description"):  # rescore on recovered JD → correct (low)
             return {"overall": 2.5, "dims": {"role_fit": 2, "skills_match": 2,
@@ -399,7 +400,7 @@ def test_cmd_scan_gate_penalizes_when_fetch_fails(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         score, "score_listing",
-        lambda l, c, p, b, model=None: {
+        lambda l, c, p, b, *, system_prompt_path=None, model=None: {
             "overall": 4.4, "dims": {"role_fit": 5, "skills_match": 4,
             "seniority": 5, "domain": 4, "location": 4,
             "responsibilities": 4},
@@ -429,7 +430,7 @@ def test_cmd_scan_gate_skips_when_description_present(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         score, "score_listing",
-        lambda l, c, p, b, model=None: {
+        lambda l, c, p, b, *, system_prompt_path=None, model=None: {
             "overall": 4.6, "dims": {"role_fit": 5, "skills_match": 5,
             "seniority": 4, "domain": 4, "location": 5,
             "responsibilities": 4},
@@ -459,7 +460,7 @@ def test_cmd_scan_gate_skips_when_score_not_above_4(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         score, "score_listing",
-        lambda l, c, p, b, model=None: {
+        lambda l, c, p, b, *, system_prompt_path=None, model=None: {
             "overall": 4.0, "dims": {"role_fit": 4, "skills_match": 4,
             "seniority": 4, "domain": 4, "location": 4,
             "responsibilities": 4},

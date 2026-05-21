@@ -27,6 +27,15 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Any, Mapping
+
+from job_discovery.types import (
+    Criteria,
+    Listing,
+    Preferences,
+    ScoreDims,
+    ScoreResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +47,46 @@ _HANDS_ON_KW = {"design", "build", "prototype", "fabricat", "test", "lab", "hand
 _COORDINATION_KW = {"manager", "coordinator", "program", "stakeholder", "governance"}
 _SENIOR_KW = {"senior", "sr.", "principal", "staff", "lead", "8+ years", "10+ years"}
 _LA_KW = {"los angeles", "la, ca", "costa mesa", "santa monica", "el segundo", "torrance"}
+
+# ---------------------------------------------------------------------------
+# Shared scoring/penalty helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_overall_score(
+    dims: Mapping[str, int], weights: Mapping[str, float],
+) -> float:
+    """Weight-and-average the dim scores into a single 1.0–5.0 overall.
+    Falls back to equal weighting if `weights` is empty so the rule-based
+    scorer can call this with `criteria.get("weights") or {}`.
+    """
+    if not weights:
+        weights = {k: 1.0 for k in dims}
+    weighted_sum = sum(dims[k] * weights.get(k, 1.0) for k in dims)
+    weight_total = sum(weights.get(k, 1.0) for k in dims)
+    return round(weighted_sum / weight_total, 1) if weight_total else 0.0
+
+
+def _init_penalty_out(score_result: ScoreResult) -> tuple[dict, str]:
+    """Shallow-copy a score result for in-place mutation without touching
+    the input, and return the prepared (out_dict, current_take_text) pair.
+    Used by both penalty functions to ensure consistent copy semantics.
+    """
+    out: dict = {**score_result, "dims": {**score_result["dims"]}}
+    take = str(out.get("one_line_take") or "").strip()
+    return out, take
+
+
+def _append_flag(take: str, flag: str) -> str:
+    """Append `flag` to `take` with the standard " — " separator, capped
+    at 200 chars. Idempotent — returns `take` unchanged if the flag is
+    already present.
+    """
+    if flag in take:
+        return take
+    combined = (take + " — " + flag) if take else flag
+    return combined[:200]
+
 
 # Words that indicate "engineering-adjacent but not target" — sales/support/etc.
 # Engineering titles with these qualifiers get aggressively downscored on
@@ -55,7 +104,7 @@ def _kw_hit(text: str, kws: set[str]) -> bool:
     return any(k in t for k in kws)
 
 
-def _score_role_fit(listing: dict, criteria: dict) -> int:
+def _score_role_fit(listing: Listing, criteria: Criteria) -> int:
     title = (listing.get("title") or "").lower()
     if not title:
         return 1
@@ -92,11 +141,11 @@ def _score_role_fit(listing: dict, criteria: dict) -> int:
     return 1
 
 
-def _score_skills_match(listing: dict, criteria: dict) -> int:
+def _score_skills_match(listing: Listing, criteria: Criteria) -> int:
     desc = (listing.get("description") or "").lower()
     if not desc:
         return 3  # no info — neutral
-    target_role_words = set()
+    target_role_words: set[str] = set()
     for r in criteria.get("roles", []):
         target_role_words.update(w.lower() for w in r.split() if len(w) > 3)
     if not target_role_words:
@@ -111,7 +160,7 @@ def _score_skills_match(listing: dict, criteria: dict) -> int:
     return 2
 
 
-def _score_seniority(listing: dict) -> int:
+def _score_seniority(listing: Listing) -> int:
     title = (listing.get("title") or "").lower()
     desc = (listing.get("description") or "").lower()
     if "intern" in title or "entry" in title or "i " in title or title.endswith(" i"):
@@ -125,7 +174,7 @@ def _score_seniority(listing: dict) -> int:
     return 4  # mid-IC default
 
 
-def _score_domain(listing: dict) -> int:
+def _score_domain(listing: Listing) -> int:
     text = (listing.get("title", "") + " " + listing.get("description", "")).lower()
     if _kw_hit(text, _AEROSPACE_KW):
         return 5
@@ -136,13 +185,13 @@ def _score_domain(listing: dict) -> int:
     return 2
 
 
-def _score_location(listing: dict, criteria: dict) -> int:
+def _score_location(listing: Listing, criteria: Criteria) -> int:
     loc = (listing.get("location") or "").lower()
     if not loc:
         return 3
     if _kw_hit(loc, _LA_KW):
         return 1  # LA — heavily downweighted, NOT a hard gate
-    target_locs = [l.lower() for l in criteria.get("locations", [])]
+    target_locs = [loc_str.lower() for loc_str in criteria.get("locations", [])]
     for tl in target_locs:
         # Match on city (first comma-separated chunk)
         city = tl.split(",")[0].strip()
@@ -152,7 +201,7 @@ def _score_location(listing: dict, criteria: dict) -> int:
     return 3
 
 
-def _score_responsibilities(listing: dict) -> int:
+def _score_responsibilities(listing: Listing) -> int:
     text = (listing.get("title", "") + " " + listing.get("description", "")).lower()
     # Sales/support/customer-facing work is the opposite of hands-on design.
     if _kw_hit(text, _NON_TARGET_QUALIFIERS):
@@ -168,13 +217,13 @@ def _score_responsibilities(listing: dict) -> int:
     return 3  # no info
 
 
-def score_rule_based(listing: dict, criteria: dict) -> dict:
+def score_rule_based(listing: Listing, criteria: Criteria) -> ScoreResult:
     """Deterministic keyword-overlap scorer. Used when the LLM call fails.
 
     Returns the same shape as score_llm(). Marked method="fallback" so the
     caller / morning brief can flag it.
     """
-    dims = {
+    dims: ScoreDims = {
         "role_fit": _score_role_fit(listing, criteria),
         "skills_match": _score_skills_match(listing, criteria),
         "seniority": _score_seniority(listing),
@@ -183,12 +232,9 @@ def score_rule_based(listing: dict, criteria: dict) -> dict:
         "responsibilities": _score_responsibilities(listing),
     }
 
-    weights = criteria.get("weights") or {}
-    if not weights:
-        weights = {k: 1.0 for k in dims}
-    weighted_sum = sum(dims[k] * weights.get(k, 1.0) for k in dims)
-    weight_total = sum(weights.get(k, 1.0) for k in dims)
-    overall = round(weighted_sum / weight_total, 1) if weight_total else 0.0
+    # TypedDicts aren't Mapping-compatible in mypy (values are `object`),
+    # but at runtime ScoreDims is just a dict[str, int].
+    overall = _compute_overall_score(dims, criteria.get("weights") or {})  # type: ignore[arg-type]
 
     title = listing.get("title") or "(untitled)"
     company = listing.get("company") or "?"
@@ -216,7 +262,7 @@ def score_rule_based(listing: dict, criteria: dict) -> dict:
 _SALARY_K_RE = re.compile(r"\$(\d+)K", re.IGNORECASE)
 
 
-def _extract_salary_min(salary_str) -> int | None:
+def _extract_salary_min(salary_str: Any) -> int | None:
     """Pull the first '$NK' value out of a salary string and return it as
     an int (e.g. '$70K-$90K' → 70000, '$70K+' → 70000). None if no match.
     """
@@ -231,7 +277,9 @@ def _extract_salary_min(salary_str) -> int | None:
         return None
 
 
-def apply_salary_penalty(score_result: dict, listing: dict, criteria: dict) -> dict:
+def apply_salary_penalty(
+    score_result: ScoreResult, listing: Listing, criteria: Criteria,
+) -> ScoreResult:
     """Post-scoring salary adjustment. Returns a NEW dict — does not mutate.
 
     Behavior (per Tavin 2026-05-12 design call):
@@ -241,39 +289,31 @@ def apply_salary_penalty(score_result: dict, listing: dict, criteria: dict) -> d
       - Listing salary < floor → reduce overall by 0.5 (clamped to 1.0 min),
         append "below floor: $XK posted vs $YK floor" to one_line_take
     """
-    out = {**score_result, "dims": dict(score_result.get("dims", {}))}
-    take = (out.get("one_line_take") or "").strip()
+    out, take = _init_penalty_out(score_result)
 
     salary_floor = criteria.get("salary_floor")
     listing_salary = listing.get("salary", "")
     listing_min = _extract_salary_min(listing_salary)
 
     if salary_floor is None:
-        return out
+        return out  # type: ignore[return-value]
 
     if listing_min is None:
-        # Missing salary → flag but don't penalize
-        flag = "salary not posted"
-        if flag not in take.lower():
-            take = (take + " — " + flag) if take else flag
-            out["one_line_take"] = take[:200]
-        return out
+        out["one_line_take"] = _append_flag(take, "salary not posted")
+        return out  # type: ignore[return-value]
 
     if listing_min < salary_floor:
-        # Below floor → soft penalty (0.5 off, min 1.0) + flag
         out["overall"] = max(1.0, round(out["overall"] - 0.5, 1))
         flag = (
             f"below floor: ${listing_min // 1000}K posted "
             f"vs ${salary_floor // 1000}K floor"
         )
-        if flag not in take:
-            take = (take + " — " + flag) if take else flag
-            out["one_line_take"] = take[:200]
+        out["one_line_take"] = _append_flag(take, flag)
 
-    return out
+    return out  # type: ignore[return-value]
 
 
-def apply_unverified_penalty(score_result: dict) -> dict:
+def apply_unverified_penalty(score_result: ScoreResult) -> ScoreResult:
     """Soft penalty for a high blind-default score we could not verify.
 
     Triggered when a listing had no scraped description AND scored >4.0 on
@@ -285,14 +325,10 @@ def apply_unverified_penalty(score_result: dict) -> dict:
       - overall reduced by 0.5 (clamped to 1.0 min)
       - append the unverified flag to one_line_take (idempotent), capped 200
     """
-    out = {**score_result, "dims": dict(score_result.get("dims", {}))}
-    take = (out.get("one_line_take") or "").strip()
+    out, take = _init_penalty_out(score_result)
     out["overall"] = max(1.0, round(out.get("overall", 0.0) - 0.5, 1))
-    flag = "⚠ unverified — JD unreadable"
-    if flag not in take:
-        take = (take + " — " + flag) if take else flag
-        out["one_line_take"] = take[:200]
-    return out
+    out["one_line_take"] = _append_flag(take, "⚠ unverified — JD unreadable")
+    return out  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -308,17 +344,38 @@ def _strip_fence(text: str) -> str:
     return m.group(1) if m else text.strip()
 
 
-def _assemble_user_prompt(
-    listing: dict, criteria: dict, preferences: dict, profile_blob: str,
-) -> str:
+def _assemble_user_prompt(listing: Listing) -> str:
+    """User prompt = ONLY the per-listing payload. The profile blob,
+    criteria, and preferences move into the system prompt so they hit
+    the Claude Code prompt cache instead of being resent on every call.
+    """
     payload = {
-        "listing": {
-            "title": listing.get("title", ""),
-            "company": listing.get("company", ""),
-            "location": listing.get("location", ""),
-            "salary": listing.get("salary", ""),
-            "description": listing.get("description", "")[:4000],  # cap to keep prompt sane
-        },
+        "title": listing.get("title", ""),
+        "company": listing.get("company", ""),
+        "location": listing.get("location", ""),
+        "salary": listing.get("salary", ""),
+        "description": listing.get("description", "")[:4000],
+    }
+    return (
+        "Job to score:\n\n```json\n"
+        + json.dumps(payload, indent=2, default=str)
+        + "\n```\n\nRespond with the JSON object only."
+    )
+
+
+def _assemble_system_prompt(
+    base_system_text: str,
+    criteria: Criteria,
+    preferences: Preferences,
+    profile_blob: str,
+) -> str:
+    """System prompt = base scoring rules + Tavin's profile + criteria +
+    preferences. All four are identical across every scoring call in a
+    nightly run, so writing them once to a stable file path lets Claude
+    Code's prompt cache amortize the ~5K-token prefix across the
+    nightly run instead of paying the cost each time.
+    """
+    static = {
         "criteria": {
             "roles": criteria.get("roles", []),
             "title_exclusions": criteria.get("title_exclusions", []),
@@ -332,15 +389,19 @@ def _assemble_user_prompt(
         },
     }
     return (
-        "Tavin's profile (excerpt from tavin.md and Job_Search/README.md):\n\n"
-        + profile_blob
-        + "\n\nJob to score:\n\n```json\n"
-        + json.dumps(payload, indent=2, default=str)
-        + "\n```\n\nRespond with the JSON object only."
+        base_system_text.rstrip()
+        + "\n\n---\n\nTavin's profile (excerpt from tavin.md and "
+        + "Job_Search/README.md):\n\n"
+        + profile_blob.rstrip()
+        + "\n\n---\n\nScoring context (criteria + preferences):\n\n```json\n"
+        + json.dumps(static, indent=2, default=str)
+        + "\n```\n"
     )
 
 
-def _parse_score_response(raw: str, weights: dict) -> dict | None:
+def _parse_score_response(
+    raw: str, weights: dict[str, float],
+) -> ScoreResult | None:
     raw = _strip_fence(raw or "")
     if not raw:
         return None
@@ -361,26 +422,63 @@ def _parse_score_response(raw: str, weights: dict) -> dict | None:
         return None
     take = (data.get("one_line_take") or "").strip()[:200]
 
-    if not weights:
-        weights = {k: 1.0 for k in required}
-    weighted_sum = sum(dims[k] * weights.get(k, 1.0) for k in required)
-    weight_total = sum(weights.get(k, 1.0) for k in required)
-    overall = round(weighted_sum / weight_total, 1) if weight_total else 0.0
+    # Narrow to the required keys so any LLM-introduced extras can't skew
+    # the weighted average.
+    dims_narrowed: dict[str, int] = {k: dims[k] for k in required}
+    overall = _compute_overall_score(dims_narrowed, weights)
 
-    return {
+    result: ScoreResult = {
         "overall": overall,
-        "dims": dims,
+        "dims": dims_narrowed,  # type: ignore[typeddict-item]
         "one_line_take": take,
         "method": "llm",
     }
+    return result
+
+
+# Haiku is plenty for a constrained classifier task with a fixed-shape JSON
+# output. Sonnet was overkill — and 5× more expensive against the daily
+# Sonnet rate-limit window that the 3am scan shares with Mizzix's morning
+# brief. Override via MIZZIX_MODEL env var if a future scoring change ever
+# needs Sonnet's reasoning quality.
+_DEFAULT_SCORING_MODEL = "claude-haiku-4-5-20251001"
+
+
+def write_scoring_system_prompt(
+    criteria: Criteria, preferences: Preferences, profile_blob: str,
+) -> Path:
+    """Write the combined system prompt (rules + profile + context) to a
+    stable file path and return it. Called ONCE per scan from cli.cmd_scan
+    so every per-listing call references the same file — Claude Code's
+    prompt cache then amortizes the ~5K-token prefix.
+
+    Idempotent: identical inputs produce identical file contents, so a
+    re-run during the same scan is harmless.
+    """
+    prompt_dir = Path(os.environ["VAULT_PATH"]) / ".mizzix_state"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    base_system_text = (
+        Path(__file__).parent / "prompts" / "scoring_system.txt"
+    ).read_text(encoding="utf-8")
+    full_text = _assemble_system_prompt(
+        base_system_text, criteria, preferences, profile_blob,
+    )
+    system_path = prompt_dir / "job_discovery_scoring_prompt.txt"
+    system_path.write_text(full_text, encoding="utf-8")
+    return system_path
 
 
 async def score_llm(
-    listing: dict, criteria: dict, preferences: dict, profile_blob: str,
+    listing: Listing, criteria: Criteria,
+    *,
+    system_prompt_path: Path,
     model: str | None = None,
-) -> dict | None:
+) -> ScoreResult | None:
     """Score one listing via Claude Agent SDK. Returns None on failure
     (caller should fall back to score_rule_based).
+
+    `system_prompt_path` is produced by write_scoring_system_prompt() once
+    per scan — keep it stable so the prompt cache hits.
 
     Mirrors morning_brief.py / heartbeat.py SDK setup pattern."""
     # Force OAuth path: if ANTHROPIC_API_KEY is set in the environment, the
@@ -394,27 +492,14 @@ async def score_llm(
         AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock,
     )
 
-    # SDK requires the system prompt as a file path (not an inline string)
-    # to dodge Windows' 32KB CreateProcess command-line limit. We write the
-    # template's contents to .mizzix_state/ on every call. Concurrent scores
-    # would race here but the contents are identical (same source file), so
-    # last-writer-wins is harmless.
-    prompt_dir = Path(os.environ["VAULT_PATH"]) / ".mizzix_state"
-    prompt_dir.mkdir(parents=True, exist_ok=True)
-    system_prompt_text = (
-        Path(__file__).parent / "prompts" / "scoring_system.txt"
-    ).read_text(encoding="utf-8")
-    system_path = prompt_dir / "job_discovery_scoring_prompt.txt"
-    system_path.write_text(system_prompt_text, encoding="utf-8")
-
-    user_prompt = _assemble_user_prompt(listing, criteria, preferences, profile_blob)
+    user_prompt = _assemble_user_prompt(listing)
 
     options = ClaudeAgentOptions(
-        system_prompt={"type": "file", "path": str(system_path)},
+        system_prompt={"type": "file", "path": str(system_prompt_path)},
         cwd=os.environ["VAULT_PATH"],
         allowed_tools=[],
         permission_mode="bypassPermissions",
-        model=model or os.environ.get("MIZZIX_MODEL", "claude-sonnet-4-6"),
+        model=model or os.environ.get("MIZZIX_MODEL", _DEFAULT_SCORING_MODEL),
     )
 
     client = ClaudeSDKClient(options=options)
@@ -438,22 +523,58 @@ async def score_llm(
     return _parse_score_response(raw, criteria.get("weights") or {})
 
 
+# Listings whose rule-based score is below this gate skip the LLM call
+# entirely — the rule-based result is used directly. Cuts daily LLM volume
+# substantially (rule-based scoring of obvious non-fits is near-perfect).
+# 2.5 is intentionally generous: anything plausible still gets the LLM
+# second opinion. Tune via PRE_FILTER_THRESHOLD env var if false-negatives
+# show up.
+PRE_FILTER_THRESHOLD = float(os.environ.get("JOB_DISCOVERY_PREFILTER", "2.5"))
+
+
 def score_listing(
-    listing: dict, criteria: dict, preferences: dict, profile_blob: str,
+    listing: Listing, criteria: Criteria, preferences: Preferences,
+    profile_blob: str,
+    *,
+    system_prompt_path: Path | None = None,
     model: str | None = None,
-) -> dict:
-    """Synchronous facade: try LLM, fall back to rule-based on failure.
+) -> ScoreResult:
+    """Synchronous facade: rule-based pre-filter → LLM if plausible →
+    fall back to rule-based on LLM failure.
+
+    The pre-filter gate is the per-night-volume lever: ~60-70% of fetched
+    listings rule-score below PRE_FILTER_THRESHOLD and don't need an LLM
+    call at all (sales/support engineer titles, wrong-domain leads, etc.).
 
     Must be called from a sync context (cli.py + cron). `asyncio.run()`
     will raise `RuntimeError` if invoked while another event loop is
     running — if a future caller is async (Jupyter, async CLI), they
     should call `score_llm` directly with `await` instead.
+
+    Legacy call sites that don't pre-build the system prompt (e.g. the
+    one-off `score-one` command) pay a small per-call file-write cost
+    when `system_prompt_path` is None — correct, just not cache-optimal.
     """
+    rule_result = score_rule_based(listing, criteria)
+    if rule_result["overall"] < PRE_FILTER_THRESHOLD:
+        # Rule-based is confident this is a non-fit. Skip the LLM call;
+        # the rule_result already has method="fallback" so downstream
+        # rendering correctly flags it.
+        return rule_result
+
+    if system_prompt_path is None:
+        system_prompt_path = write_scoring_system_prompt(
+            criteria, preferences, profile_blob,
+        )
+
     try:
-        result = asyncio.run(score_llm(listing, criteria, preferences, profile_blob, model))
+        result = asyncio.run(score_llm(
+            listing, criteria,
+            system_prompt_path=system_prompt_path, model=model,
+        ))
     except Exception:
         logger.exception("score_listing: LLM scoring crashed")
         result = None
     if result is None:
-        result = score_rule_based(listing, criteria)
+        result = rule_result
     return result
