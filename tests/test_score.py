@@ -79,6 +79,48 @@ def test_assemble_scoring_user_prompt_includes_only_listing():
     assert "Design things" in prompt
 
 
+def test_assemble_batch_user_prompt_carries_all_listings_in_array():
+    """Batch path: the user prompt carries a JSON array of N listings.
+    The cached system prompt covers profile/criteria/preferences as before."""
+    listings = [
+        {"title": "Mech Eng", "company": "Acme", "location": "Chicago",
+         "description": "Design A.", "salary": "$80K"},
+        {"title": "Thermal Eng", "company": "Beta", "location": "Denver",
+         "description": "Design B.", "salary": "$90K"},
+        {"title": "Sales Eng", "company": "Gamma", "location": "Phoenix",
+         "description": "Sell.", "salary": "$50K"},
+    ]
+    prompt = score._assemble_batch_user_prompt(listings)
+    # All three companies and descriptions must appear
+    for company in ("Acme", "Beta", "Gamma"):
+        assert company in prompt
+    for desc in ("Design A.", "Design B.", "Sell."):
+        assert desc in prompt
+    # The prompt must signal array shape (so the LLM returns an array, not
+    # a single object). Look for ordinal/array signal in the instructions.
+    lower = prompt.lower()
+    assert "array" in lower or "list" in lower
+
+
+def test_assemble_batch_user_prompt_truncates_long_descriptions():
+    """Same 4000-char truncation per item as single-listing path."""
+    listings = [
+        {"title": "Mech Eng", "company": "Acme", "location": "Chicago",
+         "description": "x" * 5000, "salary": "$80K"},
+    ]
+    prompt = score._assemble_batch_user_prompt(listings)
+    # The 5000-char body must be cut to 4000 — check by counting x's
+    assert prompt.count("x") == 4000
+
+
+def test_assemble_batch_user_prompt_empty_list_is_safe():
+    """Edge: callers shouldn't pass [], but if they do, we should produce
+    a syntactically-valid prompt rather than crashing."""
+    prompt = score._assemble_batch_user_prompt([])
+    # No crash; prompt is some string with an empty JSON array in it
+    assert "[]" in prompt
+
+
 def test_assemble_scoring_system_prompt_includes_context():
     """The system prompt carries criteria + preferences + profile so the
     cached prefix covers the parts that don't change per listing."""
@@ -151,6 +193,101 @@ def test_parse_score_response_handles_markdown_fence():
 def test_parse_score_response_returns_none_on_garbage():
     assert score._parse_score_response("not json at all", {}) is None
     assert score._parse_score_response("", {}) is None
+
+
+# -----------------------------------------------------------------------------
+# Batch response parsing: array in → list of (ScoreResult|None) out
+# -----------------------------------------------------------------------------
+
+
+_EQ_WEIGHTS = {"role_fit": 1, "skills_match": 1, "seniority": 1,
+               "domain": 1, "location": 1, "responsibilities": 1}
+
+
+def _good_score_obj(role_fit=5):
+    return {
+        "dims": {"role_fit": role_fit, "skills_match": 4, "seniority": 4,
+                 "domain": 4, "location": 4, "responsibilities": 4},
+        "one_line_take": "ok",
+    }
+
+
+def test_parse_batch_response_aligns_length_and_order():
+    """Parser returns a list of length n in input order."""
+    import json as _json
+    raw = _json.dumps([
+        _good_score_obj(role_fit=5),
+        _good_score_obj(role_fit=2),
+        _good_score_obj(role_fit=3),
+    ])
+    out = score._parse_batch_score_response(raw, _EQ_WEIGHTS, n=3)
+    assert isinstance(out, list)
+    assert len(out) == 3
+    assert out[0]["dims"]["role_fit"] == 5  # type: ignore[index]
+    assert out[1]["dims"]["role_fit"] == 2  # type: ignore[index]
+    assert out[2]["dims"]["role_fit"] == 3  # type: ignore[index]
+    # method tagged as llm
+    for item in out:
+        assert item is not None
+        assert item["method"] == "llm"
+
+
+def test_parse_batch_response_handles_markdown_fence():
+    """Same fence-stripping as the single response parser."""
+    import json as _json
+    raw = "```json\n" + _json.dumps([_good_score_obj()]) + "\n```"
+    out = score._parse_batch_score_response(raw, _EQ_WEIGHTS, n=1)
+    assert len(out) == 1
+    assert out[0] is not None
+
+
+def test_parse_batch_response_per_item_failure_returns_none_only_for_bad_item():
+    """One malformed item in the array must NOT take down the whole batch.
+    Aligned positions remain None; the rest parse normally."""
+    import json as _json
+    raw = _json.dumps([
+        _good_score_obj(role_fit=5),
+        {"dims": {"role_fit": 99}},  # out of range — should None
+        _good_score_obj(role_fit=3),
+    ])
+    out = score._parse_batch_score_response(raw, _EQ_WEIGHTS, n=3)
+    assert len(out) == 3
+    assert out[0] is not None
+    assert out[1] is None
+    assert out[2] is not None
+
+
+def test_parse_batch_response_length_mismatch_returns_all_none():
+    """If the array length doesn't match n, treat the whole batch as
+    untrusted — caller falls back to rule-based for every position."""
+    import json as _json
+    raw = _json.dumps([_good_score_obj(), _good_score_obj()])  # 2 != 3
+    out = score._parse_batch_score_response(raw, _EQ_WEIGHTS, n=3)
+    assert out == [None, None, None]
+
+
+def test_parse_batch_response_not_json_returns_all_none():
+    out = score._parse_batch_score_response("not json", _EQ_WEIGHTS, n=2)
+    assert out == [None, None]
+
+
+def test_parse_batch_response_empty_string_returns_all_none():
+    """The 'You've hit your limit' rate-limit text comes through as plain
+    English. Must collapse to all-None so callers fall back cleanly."""
+    out = score._parse_batch_score_response("", _EQ_WEIGHTS, n=3)
+    assert out == [None, None, None]
+    rate_limit_text = "You've hit your limit — resets 8:10am"
+    out2 = score._parse_batch_score_response(rate_limit_text, _EQ_WEIGHTS, n=3)
+    assert out2 == [None, None, None]
+
+
+def test_parse_batch_response_object_not_array_returns_all_none():
+    """If the model returns a single object instead of an array (LLM
+    confusion or prompt drift), don't try to salvage — fall back."""
+    import json as _json
+    raw = _json.dumps(_good_score_obj())  # not an array
+    out = score._parse_batch_score_response(raw, _EQ_WEIGHTS, n=2)
+    assert out == [None, None]
 
 
 # -----------------------------------------------------------------------------
@@ -260,3 +397,180 @@ def test_apply_unverified_penalty_does_not_mutate_input():
     score.apply_unverified_penalty(original)
     assert original["overall"] == 4.3
     assert "unverified" not in original["one_line_take"].lower()
+
+
+# -----------------------------------------------------------------------------
+# score_listings_batch — sync facade orchestrating rule-based pre-filter +
+# persistent-client batched LLM scoring with rule-based fallback for failures.
+# -----------------------------------------------------------------------------
+
+
+def _llm_payload(role_fit=4, take="llm-scored"):
+    """A fully-formed LLM-shaped ScoreResult for use in fake runners."""
+    return {
+        "overall": float(role_fit),
+        "dims": {"role_fit": role_fit, "skills_match": 4, "seniority": 4,
+                 "domain": 4, "location": 4, "responsibilities": 4},
+        "one_line_take": take,
+        "method": "llm",
+    }
+
+
+def _strong_listing(company="Acme"):
+    """Listing that scores well rule-based so it clears PRE_FILTER_THRESHOLD."""
+    return {
+        "title": "Mechanical Design Engineer",
+        "company": company,
+        "location": "Chicago, IL",
+        "salary": "$80K-$100K",
+        "description": "Hands-on aerospace design.",
+    }
+
+
+def _weak_listing(company="Junk"):
+    """Listing that scores poorly rule-based (sales/sell triggers low role_fit
+    and responsibilities) so it stays below PRE_FILTER_THRESHOLD."""
+    return {
+        "title": "Sales Engineer",
+        "company": company,
+        "location": "Phoenix, AZ",
+        "salary": "$50K",
+        "description": "Sell software.",
+    }
+
+
+def test_score_listings_batch_calls_llm_only_for_plausible(monkeypatch, tmp_path):
+    """Listings whose rule-based score < PRE_FILTER_THRESHOLD must not reach
+    the LLM. Plausible ones do — the LLM result wins for those positions."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    listings = [
+        _strong_listing("StrongA"),
+        _weak_listing("WeakB"),
+        _strong_listing("StrongC"),
+    ]
+    received = {"listings": None}
+
+    def fake_llm(plausible, weights, *, system_prompt_path, model, batch_size):
+        received["listings"] = list(plausible)
+        # Return one LLM result per plausible listing
+        return [_llm_payload(role_fit=5, take=f"llm:{l['company']}")
+                for l in plausible]
+
+    out = score.score_listings_batch(
+        listings, CRITERIA_AERO, {}, "tavin-profile",
+        _llm_score_fn=fake_llm,
+    )
+
+    # Plausible listings are exactly StrongA and StrongC, not WeakB
+    plausible_companies = [l["company"] for l in received["listings"]]
+    assert plausible_companies == ["StrongA", "StrongC"]
+
+    # Output length aligns with input
+    assert len(out) == 3
+    # Positions 0 and 2 got LLM scores; position 1 stayed rule-based
+    assert out[0]["method"] == "llm"
+    assert out[1]["method"] == "fallback"
+    assert out[2]["method"] == "llm"
+    assert out[0]["one_line_take"] == "llm:StrongA"
+    assert out[2]["one_line_take"] == "llm:StrongC"
+
+
+def test_score_listings_batch_all_below_threshold_skips_llm_entirely(
+    monkeypatch, tmp_path,
+):
+    """If no listing clears the pre-filter, the LLM runner is never invoked."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    listings = [_weak_listing("WeakA"), _weak_listing("WeakB")]
+    calls = {"n": 0}
+
+    def fake_llm(*args, **kwargs):
+        calls["n"] += 1
+        return []  # would be a bug to ever reach this
+
+    out = score.score_listings_batch(
+        listings, CRITERIA_AERO, {}, "tavin-profile",
+        _llm_score_fn=fake_llm,
+    )
+    assert calls["n"] == 0
+    assert len(out) == 2
+    assert all(r["method"] == "fallback" for r in out)
+
+
+def test_score_listings_batch_llm_none_falls_back_to_rule(monkeypatch, tmp_path):
+    """When the LLM runner returns None for a position, that listing's
+    rule-based result must be used in its place (not None, not crash)."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    listings = [_strong_listing("StrongA"), _strong_listing("StrongB")]
+
+    def fake_llm(plausible, weights, *, system_prompt_path, model, batch_size):
+        # First one parses, second one didn't
+        return [_llm_payload(role_fit=5, take="llm-good"), None]
+
+    out = score.score_listings_batch(
+        listings, CRITERIA_AERO, {}, "tavin-profile",
+        _llm_score_fn=fake_llm,
+    )
+    assert len(out) == 2
+    assert out[0]["method"] == "llm"
+    assert out[0]["one_line_take"] == "llm-good"
+    # Position 1 fell back to rule-based
+    assert out[1]["method"] == "fallback"
+
+
+def test_score_listings_batch_full_llm_failure_falls_back_for_all(
+    monkeypatch, tmp_path,
+):
+    """If the LLM runner returns all-None (rate limit, batch crash), every
+    plausible listing falls back to rule-based — the scan still produces
+    usable output."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    listings = [_strong_listing("A"), _strong_listing("B"), _weak_listing("C")]
+
+    def fake_llm(plausible, weights, *, system_prompt_path, model, batch_size):
+        return [None] * len(plausible)
+
+    out = score.score_listings_batch(
+        listings, CRITERIA_AERO, {}, "tavin-profile",
+        _llm_score_fn=fake_llm,
+    )
+    assert len(out) == 3
+    # All three end up rule-based
+    assert all(r["method"] == "fallback" for r in out)
+
+
+def test_score_listings_batch_empty_input_returns_empty(monkeypatch, tmp_path):
+    """Edge: empty input → empty output, no LLM call."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    calls = {"n": 0}
+
+    def fake_llm(*args, **kwargs):
+        calls["n"] += 1
+        return []
+
+    out = score.score_listings_batch(
+        [], CRITERIA_AERO, {}, "",
+        _llm_score_fn=fake_llm,
+    )
+    assert out == []
+    assert calls["n"] == 0
+
+
+def test_score_listings_batch_writes_system_prompt_when_not_provided(
+    monkeypatch, tmp_path,
+):
+    """When system_prompt_path is None, the facade calls write_scoring_system_prompt
+    once so the cached prefix is on disk before the LLM runner sees it."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    listings = [_strong_listing()]
+    seen = {"path": None}
+
+    def fake_llm(plausible, weights, *, system_prompt_path, model, batch_size):
+        seen["path"] = system_prompt_path
+        return [_llm_payload()]
+
+    score.score_listings_batch(
+        listings, CRITERIA_AERO, {}, "tavin-profile",
+        _llm_score_fn=fake_llm,
+    )
+    assert seen["path"] is not None
+    assert seen["path"].exists()

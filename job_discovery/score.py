@@ -344,22 +344,41 @@ def _strip_fence(text: str) -> str:
     return m.group(1) if m else text.strip()
 
 
-def _assemble_user_prompt(listing: Listing) -> str:
-    """User prompt = ONLY the per-listing payload. The profile blob,
-    criteria, and preferences move into the system prompt so they hit
-    the Claude Code prompt cache instead of being resent on every call.
-    """
-    payload = {
+def _listing_payload(listing: Listing) -> dict[str, str]:
+    """Per-listing scoring payload. Centralized so single + batch paths
+    use the identical schema and 4000-char description truncation."""
+    return {
         "title": listing.get("title", ""),
         "company": listing.get("company", ""),
         "location": listing.get("location", ""),
         "salary": listing.get("salary", ""),
         "description": listing.get("description", "")[:4000],
     }
+
+
+def _assemble_user_prompt(listing: Listing) -> str:
+    """User prompt = ONLY the per-listing payload. The profile blob,
+    criteria, and preferences move into the system prompt so they hit
+    the Claude Code prompt cache instead of being resent on every call.
+    """
     return (
         "Job to score:\n\n```json\n"
-        + json.dumps(payload, indent=2, default=str)
+        + json.dumps(_listing_payload(listing), indent=2, default=str)
         + "\n```\n\nRespond with the JSON object only."
+    )
+
+
+def _assemble_batch_user_prompt(listings: list[Listing]) -> str:
+    """User prompt for batch scoring: a JSON array of listings.
+    The model returns a JSON array of N score objects in the same order.
+    Saves ~80-90% of system-prefix tokens vs N single-listing calls."""
+    payloads = [_listing_payload(item) for item in listings]
+    return (
+        f"Score the following {len(payloads)} jobs. The input is a JSON "
+        "array; return a JSON array of the same length, one score object "
+        "per input listing, in the same order.\n\n```json\n"
+        + json.dumps(payloads, indent=2, default=str)
+        + "\n```\n\nRespond with the JSON array only."
     )
 
 
@@ -399,6 +418,40 @@ def _assemble_system_prompt(
     )
 
 
+_REQUIRED_DIMS = (
+    "role_fit", "skills_match", "seniority", "domain", "location",
+    "responsibilities",
+)
+
+
+def _validate_score_obj(
+    data: Any, weights: dict[str, float],
+) -> ScoreResult | None:
+    """Turn one parsed JSON score object into a ScoreResult, or None if
+    the shape is invalid. Shared between single + batch parsers so the
+    validation rules stay in lockstep."""
+    if not isinstance(data, dict):
+        return None
+    dims = data.get("dims")
+    if not isinstance(dims, dict):
+        return None
+    if not all(k in dims for k in _REQUIRED_DIMS):
+        logger.warning("score: missing required dims in %s", dims)
+        return None
+    if not all(isinstance(dims[k], int) and 1 <= dims[k] <= 5 for k in _REQUIRED_DIMS):
+        logger.warning("score: dim out of range in %s", dims)
+        return None
+    take = (data.get("one_line_take") or "").strip()[:200]
+    dims_narrowed: dict[str, int] = {k: dims[k] for k in _REQUIRED_DIMS}
+    overall = _compute_overall_score(dims_narrowed, weights)
+    return {
+        "overall": overall,
+        "dims": dims_narrowed,  # type: ignore[typeddict-item]
+        "one_line_take": take,
+        "method": "llm",
+    }
+
+
 def _parse_score_response(
     raw: str, weights: dict[str, float],
 ) -> ScoreResult | None:
@@ -410,30 +463,44 @@ def _parse_score_response(
     except json.JSONDecodeError:
         logger.warning("score: could not parse JSON: %s", raw[:200])
         return None
-    dims = data.get("dims")
-    if not isinstance(dims, dict):
-        return None
-    required = ["role_fit", "skills_match", "seniority", "domain", "location", "responsibilities"]
-    if not all(k in dims for k in required):
-        logger.warning("score: missing required dims in %s", dims)
-        return None
-    if not all(isinstance(dims[k], int) and 1 <= dims[k] <= 5 for k in required):
-        logger.warning("score: dim out of range in %s", dims)
-        return None
-    take = (data.get("one_line_take") or "").strip()[:200]
+    return _validate_score_obj(data, weights)
 
-    # Narrow to the required keys so any LLM-introduced extras can't skew
-    # the weighted average.
-    dims_narrowed: dict[str, int] = {k: dims[k] for k in required}
-    overall = _compute_overall_score(dims_narrowed, weights)
 
-    result: ScoreResult = {
-        "overall": overall,
-        "dims": dims_narrowed,  # type: ignore[typeddict-item]
-        "one_line_take": take,
-        "method": "llm",
-    }
-    return result
+def _parse_batch_score_response(
+    raw: str, weights: dict[str, float], n: int,
+) -> list[ScoreResult | None]:
+    """Parse a batch response (JSON array of N score objects).
+
+    Returns a list of length n where each position is either a valid
+    ScoreResult or None. Failure modes:
+      - raw empty / not JSON / not an array → all None
+      - array length mismatch → all None (untrusted whole batch)
+      - one bad item in a valid-length array → only that index is None
+
+    The caller falls back to rule-based for None positions.
+    """
+    raw = _strip_fence(raw or "")
+    all_none: list[ScoreResult | None] = [None] * n
+    if not raw:
+        return all_none
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("score: could not parse batch JSON: %s", raw[:200])
+        return all_none
+    if not isinstance(data, list):
+        logger.warning(
+            "score: batch response not a list (got %s); falling back",
+            type(data).__name__,
+        )
+        return all_none
+    if len(data) != n:
+        logger.warning(
+            "score: batch length mismatch — expected %d, got %d; falling back",
+            n, len(data),
+        )
+        return all_none
+    return [_validate_score_obj(item, weights) for item in data]
 
 
 # Haiku is plenty for a constrained classifier task with a fixed-shape JSON
@@ -466,6 +533,177 @@ def write_scoring_system_prompt(
     system_path = prompt_dir / "job_discovery_scoring_prompt.txt"
     system_path.write_text(full_text, encoding="utf-8")
     return system_path
+
+
+async def _query_batch_via_client(client: Any, listings: list[Listing]) -> str:
+    """Send a batch user prompt through an already-connected SDK client
+    and return the raw assistant text. Caller handles parse + retries.
+
+    Crashes are the caller's problem — the persistent-client orchestrator
+    catches and converts to all-None for the chunk."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    user_prompt = _assemble_batch_user_prompt(listings)
+    await client.query(user_prompt)
+    chunks: list[str] = []
+    async for message in client.receive_response():
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    chunks.append(block.text)
+    return "".join(chunks)
+
+
+async def _run_batch_llm(
+    plausible_listings: list[Listing],
+    weights: dict[str, float],
+    *,
+    system_prompt_path: Path,
+    model: str | None,
+    batch_size: int,
+) -> list[ScoreResult | None]:
+    """Open ONE SDK client, send all plausible listings through it in
+    chunks of `batch_size`, return aligned list-of-(ScoreResult|None).
+
+    The persistent client + cached system prompt means N listings cost
+    `ceil(N/batch_size)` SDK round-trips instead of N. Prompt-cache hits
+    on the 8.7K-token prefix amortize across the whole scan."""
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+    options = ClaudeAgentOptions(
+        system_prompt={"type": "file", "path": str(system_prompt_path)},
+        cwd=os.environ["VAULT_PATH"],
+        allowed_tools=[],
+        permission_mode="bypassPermissions",
+        model=model or os.environ.get("MIZZIX_MODEL", _DEFAULT_SCORING_MODEL),
+    )
+
+    out: list[ScoreResult | None] = []
+    client = ClaudeSDKClient(options=options)
+    await client.connect()
+    try:
+        for start in range(0, len(plausible_listings), batch_size):
+            chunk = plausible_listings[start:start + batch_size]
+            try:
+                raw = await _query_batch_via_client(client, chunk)
+            except Exception:
+                logger.exception(
+                    "_run_batch_llm: chunk start=%d failed; falling back",
+                    start,
+                )
+                out.extend([None] * len(chunk))
+                continue
+            out.extend(_parse_batch_score_response(raw, weights, n=len(chunk)))
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.exception("_run_batch_llm: client.disconnect() failed")
+    return out
+
+
+def _default_llm_score_fn(
+    plausible_listings: list[Listing],
+    weights: dict[str, float],
+    *,
+    system_prompt_path: Path,
+    model: str | None,
+    batch_size: int,
+) -> list[ScoreResult | None]:
+    """Sync wrapper around _run_batch_llm. Returns all-None on any
+    top-level crash so the facade falls back cleanly to rule-based."""
+    try:
+        return asyncio.run(_run_batch_llm(
+            plausible_listings, weights,
+            system_prompt_path=system_prompt_path,
+            model=model, batch_size=batch_size,
+        ))
+    except Exception:
+        logger.exception(
+            "_default_llm_score_fn: persistent-client run crashed; "
+            "falling back to rule-based for %d listings",
+            len(plausible_listings),
+        )
+        return [None] * len(plausible_listings)
+
+
+# Default chunk size — keeps user-prompt JSON well under model context
+# while still cutting SDK round-trips ~8x. Tune via env var.
+_DEFAULT_BATCH_SIZE = int(os.environ.get("JOB_DISCOVERY_BATCH_SIZE", "8"))
+
+
+def score_listings_batch(
+    listings: list[Listing],
+    criteria: Criteria,
+    preferences: Preferences,
+    profile_blob: str,
+    *,
+    system_prompt_path: Path | None = None,
+    model: str | None = None,
+    batch_size: int = _DEFAULT_BATCH_SIZE,
+    _llm_score_fn: Any = None,
+) -> list[ScoreResult]:
+    """Score a list of listings, returning an aligned list of ScoreResult.
+
+    Pipeline:
+      1. Rule-based score every listing.
+      2. Listings below PRE_FILTER_THRESHOLD keep their rule-based result.
+      3. Plausible listings go to the LLM through ONE persistent SDK client
+         in chunks of `batch_size` — saves both per-call subprocess overhead
+         and the ~8.7K-token system-prefix per call (prompt cache amortizes).
+      4. Any LLM position that came back None falls back to that listing's
+         rule-based score.
+
+    `_llm_score_fn` is the test seam — production calls _default_llm_score_fn,
+    which is the asyncio.run-wrapped persistent-client runner.
+    """
+    if not listings:
+        return []
+
+    rule_results: list[ScoreResult] = [
+        score_rule_based(l, criteria) for l in listings
+    ]
+    plausible_indices = [
+        i for i, r in enumerate(rule_results)
+        if r["overall"] >= PRE_FILTER_THRESHOLD
+    ]
+    if not plausible_indices:
+        return rule_results
+
+    if system_prompt_path is None:
+        system_prompt_path = write_scoring_system_prompt(
+            criteria, preferences, profile_blob,
+        )
+
+    plausible_listings = [listings[i] for i in plausible_indices]
+    weights = criteria.get("weights") or {}
+    llm_fn = _llm_score_fn or _default_llm_score_fn
+
+    llm_results = llm_fn(
+        plausible_listings, weights,
+        system_prompt_path=system_prompt_path,
+        model=model,
+        batch_size=batch_size,
+    )
+
+    # Belt-and-suspenders: a misbehaving fn that returned the wrong length
+    # shouldn't crash the scan. Pad/truncate to plausible_indices length.
+    if len(llm_results) != len(plausible_indices):
+        logger.warning(
+            "score_listings_batch: llm_score_fn returned %d, expected %d; "
+            "falling back to rule-based for missing positions",
+            len(llm_results), len(plausible_indices),
+        )
+        llm_results = (list(llm_results)
+                       + [None] * len(plausible_indices))[:len(plausible_indices)]
+
+    out: list[ScoreResult] = list(rule_results)
+    for idx, llm_res in zip(plausible_indices, llm_results):
+        if llm_res is not None:
+            out[idx] = llm_res
+    return out
 
 
 async def score_llm(
