@@ -5,6 +5,7 @@ for logging which boards succeeded.
 """
 import logging
 import math
+import re
 from typing import Any, Iterable, Mapping
 
 from job_discovery.types import Criteria, Listing
@@ -95,6 +96,25 @@ def normalize_listing(raw: dict[str, Any]) -> Listing:
     }
 
 
+# Trailing country segment Indeed appends to US locations ("Berkeley, MO, US")
+# but LinkedIn omits ("Berkeley, MO"). Without stripping, the same posting from
+# two boards produced two different dedupe keys — see the 5/16-5/17 Boeing
+# Berkeley dupe (jm_ca2f7f55 vs jm_7e2fc190).
+_TRAILING_COUNTRY_RE = re.compile(
+    r",\s*(?:us|usa|u\.s\.a?\.?|united states)\s*$", re.IGNORECASE,
+)
+_COMMA_SPACING_RE = re.compile(r"\s*,\s*")
+_MULTISPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_location(loc: str | None) -> str:
+    s = (loc or "").strip().lower()
+    s = _TRAILING_COUNTRY_RE.sub("", s)
+    s = _COMMA_SPACING_RE.sub(", ", s)
+    s = _MULTISPACE_RE.sub(" ", s)
+    return s.strip()
+
+
 def dedupe_key(listing: Mapping[str, Any]) -> str:
     """Normalized key for deduping the same job across boards.
 
@@ -105,7 +125,7 @@ def dedupe_key(listing: Mapping[str, Any]) -> str:
     return "|".join([
         (listing.get("company") or "").strip().lower(),
         (listing.get("title") or "").strip().lower(),
-        (listing.get("location") or "").strip().lower(),
+        _normalize_location(listing.get("location")),
     ])
 
 

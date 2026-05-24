@@ -44,6 +44,39 @@ def test_dedupe_key_is_normalized_company_title_location():
     assert search.dedupe_key(a) == search.dedupe_key(b)
 
 
+def test_dedupe_key_ignores_trailing_country_segment():
+    """Indeed appends ", US" to US locations; LinkedIn doesn't. Without
+    location normalization, the same role from both boards produces
+    different keys and survives both in-batch dedupe and cross-day
+    filter_unseen. Regression guard for the 5/16-5/17 Boeing/Berkeley dupe
+    (jm_ca2f7f55 indeed=Berkeley, MO, US / jm_7e2fc190 linkedin=Berkeley, MO).
+    """
+    indeed = {"company": "Boeing", "title": "Associate Engineer",
+              "location": "Berkeley, MO, US"}
+    linkedin = {"company": "Boeing", "title": "Associate Engineer",
+                "location": "Berkeley, MO"}
+    assert search.dedupe_key(indeed) == search.dedupe_key(linkedin)
+    # Other country-suffix spellings the boards have shipped historically
+    for suffix in (", USA", ", United States", ", U.S.", ", U.S.A."):
+        variant = {"company": "Boeing", "title": "Associate Engineer",
+                   "location": f"Berkeley, MO{suffix}"}
+        assert search.dedupe_key(variant) == search.dedupe_key(linkedin), suffix
+
+
+def test_dedupe_collapses_country_suffix_variants_across_boards():
+    """End-to-end on dedupe(): the LinkedIn winner should absorb the Indeed
+    duplicate even though their raw location strings differ."""
+    listings = [
+        {"company": "Boeing", "title": "Associate Engineer",
+         "location": "Berkeley, MO, US", "source": "indeed", "url": "i"},
+        {"company": "Boeing", "title": "Associate Engineer",
+         "location": "Berkeley, MO", "source": "linkedin", "url": "ln"},
+    ]
+    out = search.dedupe(listings)
+    assert len(out) == 1
+    assert out[0]["source"] == "linkedin"
+
+
 def test_dedupe_picks_highest_quality_source():
     listings = [
         {"company": "X", "title": "T", "location": "L", "source": "indeed", "url": "i"},
