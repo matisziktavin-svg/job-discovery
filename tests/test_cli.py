@@ -106,6 +106,10 @@ def test_cmd_scan_isolates_per_listing_scoring_failure(tmp_path, monkeypatch, ca
     Pre-fix, an uncaught exception in score_listing propagated up out of
     cmd_scan, so state.save_matches() never ran and job_matches.json was
     never written — exactly the failure mode that killed 2026-05-15's brief.
+
+    Post-batch refactor: the LLM call is now batched, but per-listing
+    isolation still applies in the salary-penalty / Match-assembly step.
+    Simulate a crash in apply_salary_penalty for one listing.
     """
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
 
@@ -134,20 +138,24 @@ def test_cmd_scan_isolates_per_listing_scoring_failure(tmp_path, monkeypatch, ca
         lambda criteria, results_per_board=50: (listings, {"linkedin@Chicago, IL": "ok"}),
     )
 
-    def fake_score_listing(listing, criteria, preferences, profile_blob,
-                           *, system_prompt_path=None, model=None):
-        if listing["company"] == "BadB":
-            raise RuntimeError("simulated scoring crash")
-        return {
+    def fake_batch(listings, criteria, preferences, profile_blob,
+                   *, system_prompt_path=None, model=None, batch_size=8):
+        return [{
             "overall": 4.0,
             "dims": {"role_fit": 4, "skills_match": 4, "seniority": 4,
                      "domain": 4, "location": 4, "responsibilities": 4},
             "one_line_take": "good fit",
             "method": "llm",
-        }
+        } for _ in listings]
 
-    monkeypatch.setattr(score, "score_listing", fake_score_listing)
-    monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
+    monkeypatch.setattr(score, "score_listings_batch", fake_batch)
+
+    def fake_salary(result, listing, criteria):
+        if listing["company"] == "BadB":
+            raise RuntimeError("simulated salary-penalty crash")
+        return result
+
+    monkeypatch.setattr(score, "apply_salary_penalty", fake_salary)
 
     args = _Args(dry_run=False, top_n=5, threshold=3.0)
     rc = cli.cmd_scan(args)
@@ -346,9 +354,22 @@ def _gate_listing(url, description=""):
     }
 
 
+def _high_score(take="looks great", overall=4.3):
+    return {
+        "overall": overall,
+        "dims": {"role_fit": 5, "skills_match": 4, "seniority": 5,
+                 "domain": 4, "location": 4, "responsibilities": 4},
+        "one_line_take": take, "method": "llm",
+    }
+
+
 def test_cmd_scan_gate_recovers_jd_and_rescores(tmp_path, monkeypatch):
     """No description + blind score >4 → WebFetch fires, listing is rescored
-    on the recovered JD (here the rescore correctly drops it)."""
+    on the recovered JD (here the rescore correctly drops it).
+
+    Batch path: the first score_listings_batch call sees an empty desc,
+    the second (after JD recovery) sees the recovered text — fake mirrors
+    that by branching on `description`."""
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
     _write_criteria(tmp_path)
     listing = _gate_listing("https://linkedin.com/jobs/view/1")
@@ -357,21 +378,22 @@ def test_cmd_scan_gate_recovers_jd_and_rescores(tmp_path, monkeypatch):
         lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
     )
 
-    calls = {"score": 0}
+    batch_calls = {"n": 0}
 
-    def fake_score_listing(l, c, p, b, *, system_prompt_path=None, model=None):
-        calls["score"] += 1
-        if l.get("description"):  # rescore on recovered JD → correct (low)
-            return {"overall": 2.5, "dims": {"role_fit": 2, "skills_match": 2,
-                    "seniority": 2, "domain": 2, "location": 2,
-                    "responsibilities": 2},
-                    "one_line_take": "senior, not a fit", "method": "llm"}
-        return {"overall": 4.3, "dims": {"role_fit": 5, "skills_match": 4,
-                "seniority": 5, "domain": 4, "location": 4,
-                "responsibilities": 4},
-                "one_line_take": "looks great", "method": "llm"}
+    def fake_batch(items, c, p, b, *, system_prompt_path=None, model=None,
+                   batch_size=8):
+        batch_calls["n"] += 1
+        return [
+            ({"overall": 2.5,
+              "dims": {"role_fit": 2, "skills_match": 2, "seniority": 2,
+                       "domain": 2, "location": 2, "responsibilities": 2},
+              "one_line_take": "senior, not a fit", "method": "llm"}
+             if (item.get("description") or "").strip()
+             else _high_score())
+            for item in items
+        ]
 
-    monkeypatch.setattr(score, "score_listing", fake_score_listing)
+    monkeypatch.setattr(score, "score_listings_batch", fake_batch)
     monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
 
     fetch_calls = []
@@ -384,7 +406,7 @@ def test_cmd_scan_gate_recovers_jd_and_rescores(tmp_path, monkeypatch):
     rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
     assert rc == 0
     assert fetch_calls == ["https://linkedin.com/jobs/view/1"]
-    assert calls["score"] == 2  # blind score + rescore
+    assert batch_calls["n"] == 2  # blind batch + rescore batch
     assert state.load_matches() == []  # rescored 2.5 < 3.0 → not surfaced
 
 
@@ -399,12 +421,9 @@ def test_cmd_scan_gate_penalizes_when_fetch_fails(tmp_path, monkeypatch):
         lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
     )
     monkeypatch.setattr(
-        score, "score_listing",
-        lambda l, c, p, b, *, system_prompt_path=None, model=None: {
-            "overall": 4.4, "dims": {"role_fit": 5, "skills_match": 4,
-            "seniority": 5, "domain": 4, "location": 4,
-            "responsibilities": 4},
-            "one_line_take": "looks great", "method": "llm"},
+        score, "score_listings_batch",
+        lambda items, c, p, b, *, system_prompt_path=None, model=None,
+        batch_size=8: [_high_score(overall=4.4) for _ in items],
     )
     monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
     monkeypatch.setattr(
@@ -429,12 +448,15 @@ def test_cmd_scan_gate_skips_when_description_present(tmp_path, monkeypatch):
         lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
     )
     monkeypatch.setattr(
-        score, "score_listing",
-        lambda l, c, p, b, *, system_prompt_path=None, model=None: {
-            "overall": 4.6, "dims": {"role_fit": 5, "skills_match": 5,
-            "seniority": 4, "domain": 4, "location": 5,
-            "responsibilities": 4},
-            "one_line_take": "great", "method": "llm"},
+        score, "score_listings_batch",
+        lambda items, c, p, b, *, system_prompt_path=None, model=None,
+        batch_size=8: [
+            {"overall": 4.6,
+             "dims": {"role_fit": 5, "skills_match": 5, "seniority": 4,
+                      "domain": 4, "location": 5, "responsibilities": 4},
+             "one_line_take": "great", "method": "llm"}
+            for _ in items
+        ],
     )
     monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
     called = []
@@ -459,12 +481,15 @@ def test_cmd_scan_gate_skips_when_score_not_above_4(tmp_path, monkeypatch):
         lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
     )
     monkeypatch.setattr(
-        score, "score_listing",
-        lambda l, c, p, b, *, system_prompt_path=None, model=None: {
-            "overall": 4.0, "dims": {"role_fit": 4, "skills_match": 4,
-            "seniority": 4, "domain": 4, "location": 4,
-            "responsibilities": 4},
-            "one_line_take": "ok", "method": "llm"},
+        score, "score_listings_batch",
+        lambda items, c, p, b, *, system_prompt_path=None, model=None,
+        batch_size=8: [
+            {"overall": 4.0,
+             "dims": {"role_fit": 4, "skills_match": 4, "seniority": 4,
+                      "domain": 4, "location": 4, "responsibilities": 4},
+             "one_line_take": "ok", "method": "llm"}
+            for _ in items
+        ],
     )
     monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
     called = []
@@ -476,3 +501,39 @@ def test_cmd_scan_gate_skips_when_score_not_above_4(tmp_path, monkeypatch):
     rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
     assert rc == 0
     assert called == []  # 4.0 is not > 4.0 → no fetch
+
+
+def test_cmd_scan_uses_batch_path_single_call_for_many_listings(tmp_path, monkeypatch):
+    """Persistent-client win: cmd_scan should make ONE call to
+    score_listings_batch for the full set of fresh listings, not N calls."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    _write_criteria(tmp_path)
+    listings = [
+        {"title": f"Mech Eng {i}", "company": f"Co{i}", "location": "Chicago, IL",
+         "url": f"u{i}", "salary": "$80K-$100K", "posted_date": "2026-05-24",
+         "source": "linkedin", "description": "Hands-on aerospace design."}
+        for i in range(10)
+    ]
+    monkeypatch.setattr(
+        search, "fetch_all",
+        lambda criteria, results_per_board=50: (listings, {"linkedin": "ok"}),
+    )
+
+    call_log = {"count": 0, "sizes": []}
+
+    def fake_batch(items, c, p, b, *, system_prompt_path=None, model=None,
+                   batch_size=8):
+        call_log["count"] += 1
+        call_log["sizes"].append(len(items))
+        return [_high_score(take=f"ok{i}", overall=4.0)
+                for i, _ in enumerate(items)]
+
+    monkeypatch.setattr(score, "score_listings_batch", fake_batch)
+    monkeypatch.setattr(score, "apply_salary_penalty", lambda r, l, c: r)
+
+    rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
+    assert rc == 0
+    # Exactly one batch call covering all 10 listings (chunking is the
+    # facade's responsibility, not cmd_scan's).
+    assert call_log["count"] == 1
+    assert call_log["sizes"] == [10]

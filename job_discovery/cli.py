@@ -170,42 +170,58 @@ def cmd_scan(args: argparse.Namespace) -> int:
         len(fresh), len(surfaced_keys), len(history_keys), len(scored_keys),
     )
 
-    scored: list[Match] = []
-    skipped = 0
-    for listing in fresh:
-        if args.dry_run:
+    if args.dry_run:
+        for listing in fresh:
             print(f"[dry-run] would score: {listing['company']} — {listing['title']}")
-            continue
-        # Per-listing isolation: a single bad row (LLM crash, unexpected
-        # listing shape, salary-penalty bug) must not drop the whole batch.
-        # score_listing already has internal LLM-failure handling, but the
-        # outer match-dict assembly and apply_salary_penalty can still raise.
-        # Bug C regression guard: pre-fix, one bad listing aborted the whole
-        # scan and `state.save_matches()` never ran.
-        try:
-            result = score.score_listing(
-                listing, criteria, preferences, profile_blob,
+        print(f"[dry-run] would have scored {len(fresh)} listings")
+        return 0
+
+    # Single batched LLM pass over all fresh listings — one persistent
+    # SDK client, chunks of `JOB_DISCOVERY_BATCH_SIZE`. Rule-based pre-filter
+    # inside the facade drops obvious non-fits before the LLM ever sees them.
+    blind_results = score.score_listings_batch(
+        fresh, criteria, preferences, profile_blob,
+        system_prompt_path=scoring_system_prompt_path,
+    )
+
+    # Hybrid JD-recovery: listings with no scraped description that came
+    # back >4.0 are suspect (unknown dims, esp. seniority, defaulted high).
+    # Spend a WebFetch on each, then rescore the rescued ones in a SECOND
+    # batched LLM pass. Failures get the unverified-penalty flag.
+    recovery_indices: list[int] = []
+    for i, (listing, result) in enumerate(zip(fresh, blind_results)):
+        if (not (listing.get("description") or "").strip()
+                and result["overall"] > 4.0):
+            recovery_indices.append(i)
+
+    if recovery_indices:
+        rescued: list[int] = []  # indices where fetch returned text
+        for i in recovery_indices:
+            jd = fetch_jd.fetch_job_description(fresh[i]["url"])
+            if jd:
+                fresh[i]["description"] = jd
+                rescued.append(i)
+            else:
+                blind_results[i] = score.apply_unverified_penalty(
+                    blind_results[i]
+                )
+
+        if rescued:
+            rescore_inputs = [fresh[i] for i in rescued]
+            rescore_results = score.score_listings_batch(
+                rescore_inputs, criteria, preferences, profile_blob,
                 system_prompt_path=scoring_system_prompt_path,
             )
-            # Hybrid JD recovery: a no-description listing that still scored
-            # >4 is suspect — unknown dims (esp. seniority) defaulted high.
-            # Spend a WebFetch to recover the real JD and rescore. If the
-            # fetch also fails, soft-downrank + flag rather than trust the
-            # blind score or silently drop a wall-blocked posting.
-            if (not (listing.get("description") or "").strip()
-                    and result["overall"] > 4.0):
-                jd = fetch_jd.fetch_job_description(listing["url"])
-                if jd:
-                    listing["description"] = jd
-                    result = score.score_listing(
-                        listing, criteria, preferences, profile_blob,
-                        system_prompt_path=scoring_system_prompt_path,
-                    )
-                else:
-                    result = score.apply_unverified_penalty(result)
-            # Salary is a deterministic post-step (orchestrator-applied so both
-            # LLM and rule-based paths get the same treatment): missing salary
-            # gets flagged; below-floor gets soft-penalized 0.5.
+            for idx, new_result in zip(rescued, rescore_results):
+                blind_results[idx] = new_result
+
+    scored: list[Match] = []
+    skipped = 0
+    for listing, result in zip(fresh, blind_results):
+        # Per-listing isolation: apply_salary_penalty + Match-dict assembly
+        # can still raise on a malformed listing. One bad row must not abort
+        # the whole scan (Bug C regression guard).
+        try:
             result = score.apply_salary_penalty(result, listing, criteria)
             match: Match = {
                 "id": state.new_match_id(),
@@ -230,17 +246,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
         except Exception:
             skipped += 1
             logger.exception(
-                "scan: scoring crashed for company=%r title=%r; skipping listing",
+                "scan: post-scoring assembly crashed for company=%r title=%r; "
+                "skipping listing",
                 listing.get("company"), listing.get("title"),
             )
             continue
         scored.append(match)
     if skipped:
-        logger.warning("scan: skipped %d listing(s) due to scoring errors", skipped)
-
-    if args.dry_run:
-        print(f"[dry-run] would have scored {len(fresh)} listings")
-        return 0
+        logger.warning("scan: skipped %d listing(s) due to post-scoring errors", skipped)
 
     top = _select_top_n(scored, n=args.top_n, threshold=args.threshold)
     merged = _merge_with_carryforward(top, today)
