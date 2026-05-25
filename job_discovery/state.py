@@ -17,6 +17,7 @@ from pathlib import Path
 
 from job_discovery.types import (
     Criteria,
+    ExperienceProfile,
     Match,
     Preferences,
     ScoredHistoryEntry,
@@ -283,7 +284,50 @@ def read_criteria() -> Criteria:
     out["weights"] = weights
 
     out["notes"] = sections.get("notes", "")
+
+    experience = _parse_experience_section(sections.get("experience profile", ""))
+    if experience:
+        out["experience"] = experience
+
     return out
+
+
+def _parse_experience_section(body: str) -> ExperienceProfile | None:
+    """Parse the ## Experience profile section. Returns None if empty.
+
+    Recognized bullet keys (case-insensitive, snake_case):
+      - years_total: <int>
+      - domains: <comma-separated slugs>
+      - hard_filter_years_above: <int>
+
+    Unknown keys are ignored — keeps the parser tolerant of future
+    additions written by hand or by an onboarding interview.
+    """
+    if not body.strip():
+        return None
+    out: ExperienceProfile = {}
+    for line in _bullet_lines(body):
+        m = re.match(r"^([\w_]+)\s*:\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        key = m.group(1).lower()
+        raw = m.group(2)
+        if key == "years_total":
+            try:
+                out["years_total"] = int(raw)
+            except ValueError:
+                continue
+        elif key == "domains":
+            out["domains"] = [
+                s.strip().lower().replace(" ", "_")
+                for s in raw.split(",") if s.strip()
+            ]
+        elif key == "hard_filter_years_above":
+            try:
+                out["hard_filter_years_above"] = int(raw)
+            except ValueError:
+                continue
+    return out or None
 
 
 def read_preferences() -> Preferences:

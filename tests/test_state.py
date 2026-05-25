@@ -163,6 +163,41 @@ def test_read_criteria_returns_empty_when_missing(tmp_path, monkeypatch):
     assert crit["weights"] == {}
 
 
+def test_read_criteria_parses_experience_profile(tmp_path, monkeypatch):
+    """The ## Experience profile section produces a structured experience
+    dict the scorer's apply_experience_penalty consumes."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True)
+    crit_path.write_text(CRITERIA_FIXTURE + """
+## Experience profile
+
+- years_total: 2
+- domains: aerospace, thermal, cryogenic, mechanical_design, test_operations
+- hard_filter_years_above: 3
+""", encoding="utf-8")
+
+    crit = state.read_criteria()
+    exp = crit.get("experience")
+    assert exp is not None
+    assert exp["years_total"] == 2
+    assert exp["hard_filter_years_above"] == 3
+    assert "aerospace" in exp["domains"]
+    assert "mechanical_design" in exp["domains"]
+
+
+def test_read_criteria_no_experience_section_omits_key(tmp_path, monkeypatch):
+    """When criteria.md has no ## Experience profile section, the key is
+    absent from the dict — apply_experience_penalty no-ops on this."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    crit_path = tmp_path / "projects" / "Job_Search" / "discovery" / "criteria.md"
+    crit_path.parent.mkdir(parents=True)
+    crit_path.write_text(CRITERIA_FIXTURE, encoding="utf-8")
+
+    crit = state.read_criteria()
+    assert "experience" not in crit or not crit.get("experience")
+
+
 def test_read_preferences_returns_recent_pass_reasons(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
     pref_path = tmp_path / "projects" / "Job_Search" / "discovery" / "preferences.md"

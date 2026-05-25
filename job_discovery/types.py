@@ -21,6 +21,20 @@ class Listing(TypedDict):
     description: str
 
 
+class ExperienceProfile(TypedDict, total=False):
+    """Structured representation of Tavin's years/domain experience —
+    used by `apply_experience_penalty` to detect listings whose required
+    years exceed his profile (hard filter) or whose required-years phrase
+    sits in a domain context he lacks (soft penalty).
+
+    Sourced from the `## Experience profile` section of criteria.md.
+    All fields optional: missing section = penalty is a no-op.
+    """
+    years_total: int
+    domains: list[str]
+    hard_filter_years_above: int
+
+
 class Criteria(TypedDict):
     """Parsed criteria.md — see `state.read_criteria`."""
     roles: list[str]
@@ -30,6 +44,7 @@ class Criteria(TypedDict):
     hard_gates: list[str]
     weights: dict[str, float]
     notes: str
+    experience: NotRequired[ExperienceProfile]
 
 
 class PassReason(TypedDict):
