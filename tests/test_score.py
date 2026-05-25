@@ -400,6 +400,282 @@ def test_apply_unverified_penalty_does_not_mutate_input():
 
 
 # -----------------------------------------------------------------------------
+# Required-years extraction from JD text
+# -----------------------------------------------------------------------------
+
+
+def test_extract_required_years_single_number():
+    """'3 years experience' / '3 yrs experience' → (3, 3)."""
+    assert score.extract_required_years("Requires 3 years experience.") == (3, 3)
+    assert score.extract_required_years("3 yrs experience required.") == (3, 3)
+    assert score.extract_required_years("5 years of relevant experience") == (5, 5)
+
+
+def test_extract_required_years_range():
+    """'3-7 years' / '3 to 7 years' → (3, 7)."""
+    assert score.extract_required_years("3-7 years of experience") == (3, 7)
+    assert score.extract_required_years("3 to 7 years experience") == (3, 7)
+    assert score.extract_required_years("3–7 yrs experience") == (3, 7)  # en-dash
+
+
+def test_extract_required_years_plus():
+    """'5+ years' → (5, None) — lower bound only, unbounded above."""
+    assert score.extract_required_years("5+ years experience") == (5, None)
+    assert score.extract_required_years("10+ years of experience") == (10, None)
+
+
+def test_extract_required_years_minimum():
+    """'minimum 2 years' / 'at least 5 years' → (N, None)."""
+    assert score.extract_required_years("minimum 2 years experience") == (2, None)
+    assert score.extract_required_years("at least 5 years of experience") == (5, None)
+    assert score.extract_required_years("min 3 yrs") == (3, None)
+
+
+def test_extract_required_years_takes_largest_max_when_multiple():
+    """If a JD has multiple year phrases, take the highest signal —
+    e.g., '2 years required, 5+ preferred' → effective max is 5+."""
+    text = "Requires 2 years experience. 5+ years strongly preferred."
+    lo, hi = score.extract_required_years(text)
+    # The "5+" phrase is the more demanding bar — pick that as the effective
+    assert lo == 5
+    assert hi is None  # "5+" leaves hi unbounded
+
+
+def test_extract_required_years_no_match_returns_none():
+    assert score.extract_required_years("") == (None, None)
+    assert score.extract_required_years("entry-level position") == (None, None)
+    assert score.extract_required_years(
+        "Looking for someone curious and motivated."
+    ) == (None, None)
+
+
+def test_extract_required_years_ignores_unrelated_year_numbers():
+    """'30+ years in business' / 'founded in 2014' must NOT register
+    as a years-of-experience requirement."""
+    assert score.extract_required_years(
+        "Therm-X has been delivering for 30+ years."
+    ) == (None, None)
+    assert score.extract_required_years(
+        "Founded in 2014, the company has grown..."
+    ) == (None, None)
+
+
+# -----------------------------------------------------------------------------
+# Experience penalty — the main fix for the years/domain scoring bug.
+# Named regression cases: Auriga (hard filter), Burns (soft + domain mismatch),
+# United Safety (no penalty).
+# -----------------------------------------------------------------------------
+
+
+CRITERIA_WITH_EXPERIENCE = {
+    **CRITERIA_AERO,
+    "experience": {
+        "years_total": 2,
+        "domains": ["aerospace", "thermal", "cryogenic",
+                    "mechanical_design", "test_operations"],
+        "hard_filter_years_above": 3,
+    },
+}
+
+
+def test_apply_experience_penalty_no_profile_no_change():
+    """Without an experience profile in criteria, the penalty is a no-op."""
+    listing = {"title": "x", "description": "3 years required."}
+    result = score.apply_experience_penalty(_mk_score_result(4.0), listing, {})
+    assert result["overall"] == 4.0
+
+
+def test_apply_experience_penalty_no_years_in_jd_no_change():
+    """JD with no years phrase → no penalty (we can't punish what we can't see)."""
+    listing = {"title": "Mech Eng", "description": "Hands-on design work."}
+    result = score.apply_experience_penalty(
+        _mk_score_result(4.0), listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    assert result["overall"] == 4.0
+
+
+def test_apply_experience_penalty_auriga_3_to_7_years_hard_filter():
+    """Regression: Auriga Space (5/21) — '3-7 years experience' must be
+    hard-filtered out of the brief. Max=7 > years_total(2) + buffer(3) = 5."""
+    listing = {
+        "title": "Mechanical Design Engineer",
+        "company": "Auriga Space",
+        "description": (
+            "Aerospace startup building electromagnetic launch hardware. "
+            "Requires 3-7 years of experience in mechanical design."
+        ),
+    }
+    result = score.apply_experience_penalty(
+        _mk_score_result(4.3), listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    assert result["overall"] == 1.0  # Pushed to floor — hard filter
+    assert "hard-filter" in result["one_line_take"].lower()
+    assert "7" in result["one_line_take"]  # Cite the offending years
+
+
+def test_apply_experience_penalty_burns_3_years_power_soft_with_domain_mismatch():
+    """Regression: Burns & McDonnell (5/25) — '3 years experience in power'
+    must soft-penalize. 3 yrs alone wouldn't kill it, but the POWER domain
+    isn't in Tavin's profile, so the penalty steps up.
+    """
+    listing = {
+        "title": "Mechanical Engineer - Power",
+        "company": "Burns & McDonnell",
+        "description": (
+            "Designing mechanical systems for power generation projects. "
+            "Requires 3 years experience in power, multi-discipline team."
+        ),
+    }
+    pre = _mk_score_result(4.5)
+    result = score.apply_experience_penalty(
+        pre, listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    # Hard filter should NOT fire (3 not > 5). Soft penalty should reduce
+    # seniority dim and lower overall.
+    assert 1.0 < result["overall"] < pre["overall"]
+    assert result["dims"]["seniority"] < pre["dims"]["seniority"]
+    # Domain mismatch flag should mention the years requirement and that
+    # it falls outside Tavin's domains (power isn't in his profile).
+    take = result["one_line_take"].lower()
+    assert "yrs" in take or "years" in take
+    assert "non-domain" in take
+
+
+def test_apply_experience_penalty_burns_harder_than_aerospace_equivalent():
+    """A 3-yr power role should be hit HARDER than a 3-yr aerospace role
+    (Tavin has aerospace experience, not power). Captures the domain
+    multiplier behavior Tavin asked for."""
+    power_listing = {
+        "title": "Mechanical Engineer",
+        "company": "Burns",
+        "description": "Requires 3 years experience in power generation.",
+    }
+    aero_listing = {
+        "title": "Mechanical Engineer",
+        "company": "Aero Co",
+        "description": "Requires 3 years experience in aerospace propulsion.",
+    }
+    power_result = score.apply_experience_penalty(
+        _mk_score_result(4.5), power_listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    aero_result = score.apply_experience_penalty(
+        _mk_score_result(4.5), aero_listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    # The power listing should be penalized MORE than the aerospace one
+    assert power_result["overall"] < aero_result["overall"]
+
+
+def test_apply_experience_penalty_united_safety_min_2_no_penalty():
+    """Regression: United Safety Level 1 — 'minimum 2 years' is exactly
+    Tavin's years_total, no penalty should fire."""
+    listing = {
+        "title": "Level 1 Design Engineer",
+        "company": "United Safety",
+        "description": "Minimum 2 years experience or equivalent combination.",
+    }
+    pre = _mk_score_result(4.1)
+    result = score.apply_experience_penalty(
+        pre, listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    assert result["overall"] == pre["overall"]
+    assert result["dims"]["seniority"] == pre["dims"]["seniority"]
+
+
+def test_apply_experience_penalty_does_not_mutate_input():
+    """Same contract as the other penalties: return a new dict."""
+    listing = {"description": "3-7 years experience"}
+    original = _mk_score_result(4.5)
+    score.apply_experience_penalty(original, listing, CRITERIA_WITH_EXPERIENCE)
+    assert original["overall"] == 4.5
+    assert "hard-filter" not in original["one_line_take"].lower()
+
+
+def test_apply_experience_penalty_clamps_at_1():
+    """Penalty must not produce overall < 1.0 even if pre-penalty is low."""
+    listing = {"description": "10+ years experience required."}
+    result = score.apply_experience_penalty(
+        _mk_score_result(1.5), listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    assert result["overall"] >= 1.0
+
+
+# -----------------------------------------------------------------------------
+# Integration: score_listings_batch must hard-filter pre-LLM and
+# soft-penalize post-LLM. Hard-filtered listings should never reach the
+# fake LLM runner.
+# -----------------------------------------------------------------------------
+
+
+def test_score_listings_batch_hard_filters_before_llm(monkeypatch, tmp_path):
+    """A listing that triggers experience hard-filter must not be sent
+    to the LLM. Saves daily Sonnet/Haiku budget on doomed listings."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    listings = [
+        # Rule-based plausible (mech eng + chicago) but hard-filtered on years
+        {
+            "title": "Mechanical Engineer",
+            "company": "AurigaLike",
+            "location": "Chicago, IL",
+            "salary": "$90K",
+            "description": "Requires 3-7 years of experience in mechanical design.",
+        },
+        # Clean strong listing — should reach LLM
+        _strong_listing("StrongA"),
+    ]
+    received = {"listings": None}
+
+    def fake_llm(plausible, weights, *, system_prompt_path, model, batch_size):
+        received["listings"] = list(plausible)
+        return [_llm_payload(role_fit=5) for _ in plausible]
+
+    out = score.score_listings_batch(
+        listings, CRITERIA_WITH_EXPERIENCE, {}, "tavin-profile",
+        _llm_score_fn=fake_llm,
+    )
+    # The hard-filtered listing must NOT have been sent to LLM
+    plausible_companies = [l["company"] for l in (received["listings"] or [])]
+    assert "AurigaLike" not in plausible_companies
+    assert "StrongA" in plausible_companies
+    # Hard-filtered listing keeps fallback method with overall pushed low
+    assert out[0]["method"] == "fallback"
+    assert out[0]["overall"] == 1.0
+    assert "hard-filter" in out[0]["one_line_take"].lower()
+
+
+def test_score_listings_batch_soft_penalty_applied_after_llm(monkeypatch, tmp_path):
+    """A 3-yr-power listing that LLM optimistically scores high must still
+    get the soft penalty applied — domain-mismatch is enforced even when
+    the LLM was generous."""
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    listings = [{
+        "title": "Mechanical Engineer",
+        "company": "BurnsLike",
+        "location": "Chicago, IL",
+        "salary": "$90K",
+        "description": "Requires 3 years experience in power generation.",
+    }]
+
+    def generous_llm(plausible, weights, *, system_prompt_path, model, batch_size):
+        # LLM rates it 4.5, seniority=4 (the bug we're closing)
+        return [{
+            "overall": 4.5,
+            "dims": {"role_fit": 5, "skills_match": 4, "seniority": 4,
+                     "domain": 4, "location": 5, "responsibilities": 4},
+            "one_line_take": "looks great",
+            "method": "llm",
+        }]
+
+    out = score.score_listings_batch(
+        listings, CRITERIA_WITH_EXPERIENCE, {}, "tavin-profile",
+        _llm_score_fn=generous_llm,
+    )
+    assert len(out) == 1
+    # Soft penalty must have lowered the overall and the seniority dim
+    assert out[0]["overall"] < 4.5
+    assert out[0]["dims"]["seniority"] < 4
+
+
+# -----------------------------------------------------------------------------
 # score_listings_batch — sync facade orchestrating rule-based pre-filter +
 # persistent-client batched LLM scoring with rule-based fallback for failures.
 # -----------------------------------------------------------------------------

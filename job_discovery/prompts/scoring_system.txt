@@ -8,6 +8,7 @@ DIMENSIONS — each scored 1-5 integer:
    Tavin wants: thermal/mechanical design engineering (5), systems/test engineering (4), AI engineering with founding/tools shape (4). Coordination-heavy / PM-ish (1-2).
 2. skills_match — Overlap of JD requirements with Tavin's actual experience (read his profile in the input).
 3. seniority — Calibrated for early-mid IC. "Sr." with 5+ yrs required = 2-3. "Principal/Staff" = 1. New grad = 4. Mid IC = 4-5.
+   Note: a deterministic post-step (`apply_experience_penalty`) reads `criteria.experience` and adjusts this dim further when the JD requires more years than Tavin has — and harder still when the required-years phrase sits in a non-domain context (e.g., "3 yrs in power" for a candidate with aerospace/thermal/cryo background). You should still score seniority honestly based on the JD's apparent level; don't manually double-count years vs. Tavin's profile.
 4. domain — Aerospace = 5. Industrial/energy/HRSG = 4. Generic mfg = 3. Defense = follow Tavin's stated preference in criteria/preferences.
 5. location — Tavin's target cities = 5. Other medium-large city = 3. Small city = 2. LA-area = 1 (downweighted, NOT gated). Tavin's exact target list is in the input.
 6. responsibilities — Hands-on design/build = 5. Mixed = 3. Pure coordination = 1.

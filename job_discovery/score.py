@@ -31,6 +31,7 @@ from typing import Any, Mapping
 
 from job_discovery.types import (
     Criteria,
+    ExperienceProfile,
     Listing,
     Preferences,
     ScoreDims,
@@ -309,6 +310,264 @@ def apply_salary_penalty(
             f"vs ${salary_floor // 1000}K floor"
         )
         out["one_line_take"] = _append_flag(take, flag)
+
+    return out  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Experience handling — deterministic years/domain penalty applied after
+# rule-based scoring (pre-LLM gate) AND after LLM scoring (so the soft
+# penalty is enforced even when the LLM was generous on the seniority dim).
+#
+# Closes the recurring "3+ yrs required slipped through" bug surfaced
+# 2026-05-16 (Akkodis), 2026-05-21 (Auriga Space), 2026-05-25 (Burns &
+# McDonnell).
+# ---------------------------------------------------------------------------
+
+_YEARS_RANGE_DASH_RE = re.compile(
+    r"(\d+)\s*[-–—]\s*(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+)
+_YEARS_RANGE_TO_RE = re.compile(
+    r"(\d+)\s+to\s+(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+)
+_YEARS_PLUS_RE = re.compile(
+    r"(\d+)\s*\+\s*(?:years?|yrs?)\b", re.IGNORECASE,
+)
+_YEARS_MIN_RE = re.compile(
+    r"(?:min(?:imum)?|at\s+least)\s+(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+)
+_YEARS_PLAIN_RE = re.compile(
+    r"(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+)
+# "experience"-y context words that must appear within _CONTEXT_WINDOW chars
+# of a year phrase for it to count as a years-of-experience requirement (vs
+# "30+ years in business" or "founded 2014"). The "min/at least" pattern is
+# self-evidencing and skips this check.
+_EXPERIENCE_INDICATOR_RE = re.compile(
+    r"\b(?:experience|exp\.?|relevant|professional|background|qualif\w+|"
+    r"required|preferred|seeking)\b",
+    re.IGNORECASE,
+)
+_CONTEXT_WINDOW = 40
+
+
+# Each Tavin-domain slug → keyword list scanned against the JD text. Living
+# in code (not criteria.md) so it can be versioned with the scorer and
+# extended without a vault edit. Keep the keywords precise — a too-broad
+# "mechanical" would match every mech eng JD and erase the mismatch signal.
+_DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "aerospace": (
+        "aerospace", "aircraft", "aviation", "spacecraft", "satellite",
+        "nasa", "propulsion", "rocket", "launch vehicle", "avionics",
+        "artemis", "ksc",
+    ),
+    "thermal": (
+        "thermal", "heat transfer", "heat exchanger", "hvac", "thermodynamic",
+        "cooling system",
+    ),
+    "cryogenic": (
+        "cryogenic", "cryogen", "lh2", "lox", "liquid nitrogen", "ln2",
+        "liquid hydrogen", "tvc", "thermal vacuum",
+    ),
+    "mechanical_design": (
+        "mechanical design", "mechanical engineering", "solidworks",
+        "gd&t", "drafting", "fabrication", "cad model",
+    ),
+    "test_operations": (
+        "test conductor", "integration test", "test engineering",
+        "test campaign", "hil", "dvt", "ground support",
+    ),
+}
+
+# Non-Tavin domain keywords. A JD that mentions one of these AND lacks any
+# Tavin-domain keyword is treated as a domain mismatch (penalty +1). The
+# Burns-McDonnell case ("power generation") is the canonical example.
+_NON_DOMAIN_KEYWORDS: tuple[str, ...] = (
+    "power generation", "power plant", "petroleum", "oil and gas",
+    "oil & gas", "automotive", "vehicle dynamics", "medical device",
+    "consumer electronics", "robotics", "mining", "agriculture",
+    "food processing", "semiconductor fab",
+)
+
+
+def _has_experience_context(text: str, span: tuple[int, int]) -> bool:
+    start = max(0, span[0] - _CONTEXT_WINDOW)
+    end = min(len(text), span[1] + _CONTEXT_WINDOW)
+    return bool(_EXPERIENCE_INDICATOR_RE.search(text[start:end]))
+
+
+def _spans_overlap(s1: tuple[int, int], s2: tuple[int, int]) -> bool:
+    return not (s1[1] <= s2[0] or s2[1] <= s1[0])
+
+
+def extract_required_years(text: str) -> tuple[int | None, int | None]:
+    """Extract the most demanding years-of-experience requirement from text.
+
+    Returns (min_required, max_required).
+      - Range "3-7 years"  → (3, 7)
+      - Plus  "5+ years"   → (5, None)   — unbounded above
+      - Min   "min 2 yrs"  → (2, None)   — unbounded above
+      - Plain "3 years exp"→ (3, 3)
+      - No match           → (None, None)
+
+    For everything except `min/at least`, the year phrase must sit within
+    `_CONTEXT_WINDOW` chars of an "experience"-y indicator (experience,
+    relevant, professional, required, preferred, etc.). This is what
+    keeps "30+ years in business" / "founded in 2014" from registering.
+
+    If multiple phrases match, the most demanding wins: highest effective
+    upper bound, with unbounded-above (`+`/`min`) preferred at ties.
+    """
+    if not text:
+        return (None, None)
+
+    # (lo, hi_or_None, effective_for_ranking, span)
+    candidates: list[tuple[int, int | None, int, tuple[int, int]]] = []
+    consumed: list[tuple[int, int]] = []
+
+    # 1) Ranges first — they're the most specific. "3-7 years" and "3 to 7 years".
+    for m in _YEARS_RANGE_DASH_RE.finditer(text):
+        if _has_experience_context(text, m.span()):
+            lo, hi = int(m.group(1)), int(m.group(2))
+            candidates.append((lo, hi, hi, m.span()))
+            consumed.append(m.span())
+    for m in _YEARS_RANGE_TO_RE.finditer(text):
+        if any(_spans_overlap(m.span(), s) for s in consumed):
+            continue
+        if _has_experience_context(text, m.span()):
+            lo, hi = int(m.group(1)), int(m.group(2))
+            candidates.append((lo, hi, hi, m.span()))
+            consumed.append(m.span())
+
+    # 2) Plus — "5+ years". Context required (don't trip on "30+ years in business").
+    for m in _YEARS_PLUS_RE.finditer(text):
+        if any(_spans_overlap(m.span(), s) for s in consumed):
+            continue
+        if _has_experience_context(text, m.span()):
+            n = int(m.group(1))
+            candidates.append((n, None, n, m.span()))
+            consumed.append(m.span())
+
+    # 3) Minimum — self-evidencing, no context check needed.
+    for m in _YEARS_MIN_RE.finditer(text):
+        if any(_spans_overlap(m.span(), s) for s in consumed):
+            continue
+        n = int(m.group(1))
+        candidates.append((n, None, n, m.span()))
+        consumed.append(m.span())
+
+    # 4) Plain "N years" with context. Lowest precedence.
+    for m in _YEARS_PLAIN_RE.finditer(text):
+        if any(_spans_overlap(m.span(), s) for s in consumed):
+            continue
+        if _has_experience_context(text, m.span()):
+            n = int(m.group(1))
+            candidates.append((n, n, n, m.span()))
+            consumed.append(m.span())
+
+    if not candidates:
+        return (None, None)
+
+    # Most demanding: highest effective, tie-break unbounded-above first.
+    candidates.sort(
+        key=lambda c: (c[2], 1 if c[1] is None else 0),
+        reverse=True,
+    )
+    lo, hi, _, _ = candidates[0]
+    return (lo, hi)
+
+
+def _is_domain_mismatch(text: str, tavin_domains: list[str]) -> bool:
+    """True if the listing text contains a non-Tavin-domain keyword AND
+    lacks any keyword for Tavin's domains. Conservative — a listing that
+    mentions both 'power' and 'aerospace' is not a mismatch (overlap wins)."""
+    if not tavin_domains:
+        return False
+    text_lower = text.lower()
+    for slug in tavin_domains:
+        keywords = _DOMAIN_KEYWORDS.get(
+            slug, (slug.replace("_", " "),),
+        )
+        if any(kw in text_lower for kw in keywords):
+            return False  # Tavin-domain overlap — no mismatch
+    return any(kw in text_lower for kw in _NON_DOMAIN_KEYWORDS)
+
+
+def _format_years_str(lo: int, hi: int | None) -> str:
+    """Human-readable years string for one_line_take flags.
+    (3, 7) → '3-7', (5, None) → '5+', (3, 3) → '3'."""
+    if hi is None:
+        return f"{lo}+"
+    if hi == lo:
+        return str(lo)
+    return f"{lo}-{hi}"
+
+
+def apply_experience_penalty(
+    score_result: ScoreResult, listing: Listing, criteria: Criteria,
+) -> ScoreResult:
+    """Post-scoring years/domain penalty. Returns a NEW dict — does not mutate.
+
+    Behavior (per Tavin 2026-05-25 design call):
+      - No `experience` profile in criteria OR no `years_total` → no change.
+      - No years phrase extracted from JD → no change.
+      - effective_required >= years_total + hard_filter_years_above:
+          HARD FILTER. Set overall to 1.0 and flag "hard-filter: requires Xyrs"
+          so the listing drops below PRE_FILTER_THRESHOLD and bypasses LLM.
+      - effective_required > years_total:
+          SOFT PENALTY. Drop seniority dim by (years_above + domain_mismatch),
+          recompute overall, append "Xyrs required (you have ~M)" flag.
+      - effective_required <= years_total: no change.
+
+    Idempotent: re-applying with the same input gives the same output
+    (seniority is set to a target value computed from the JD, not
+    decremented). Safe to call both pre- and post-LLM.
+    """
+    experience: ExperienceProfile | None = criteria.get("experience")  # type: ignore[assignment]
+    if not experience or "years_total" not in experience:
+        return score_result
+
+    title = (listing.get("title") or "")
+    desc = (listing.get("description") or "")
+    listing_text = f"{title} {desc}"
+    lo, hi = extract_required_years(desc)
+    if lo is None:
+        return score_result
+
+    out, take = _init_penalty_out(score_result)
+    years_total = experience["years_total"]
+    buffer = experience.get("hard_filter_years_above", 3)
+    effective_required = hi if hi is not None else lo
+    years_str = _format_years_str(lo, hi)
+
+    if effective_required >= years_total + buffer:
+        out["overall"] = 1.0
+        out["one_line_take"] = _append_flag(
+            take, f"hard-filter: requires {years_str}yrs",
+        )
+        return out  # type: ignore[return-value]
+
+    if effective_required > years_total:
+        years_above = effective_required - years_total
+        mismatch = _is_domain_mismatch(
+            listing_text, list(experience.get("domains", [])),
+        )
+        penalty_points = years_above + (1 if mismatch else 0)
+
+        dims = dict(out["dims"])
+        # Target the seniority dim. Use max(1, current - penalty) — clamps
+        # at the 1.0 floor and makes the function idempotent.
+        dims["seniority"] = max(1, dims["seniority"] - penalty_points)
+        out["dims"] = dims  # type: ignore[typeddict-item]
+        out["overall"] = max(1.0, _compute_overall_score(
+            dims, criteria.get("weights") or {},
+        ))
+
+        flag = f"{years_str}yrs required (you have ~{years_total})"
+        if mismatch:
+            flag += " in non-domain"
+        out["one_line_take"] = _append_flag(take, flag)
+        return out  # type: ignore[return-value]
 
     return out  # type: ignore[return-value]
 
@@ -665,6 +924,13 @@ def score_listings_batch(
     rule_results: list[ScoreResult] = [
         score_rule_based(l, criteria) for l in listings
     ]
+    # Experience penalty BEFORE the plausibility gate so years/domain hard-
+    # filters drop the overall below PRE_FILTER_THRESHOLD and never reach
+    # the LLM. Soft-penalty cases still go to LLM with their dims adjusted.
+    rule_results = [
+        apply_experience_penalty(r, l, criteria)
+        for r, l in zip(rule_results, listings)
+    ]
     plausible_indices = [
         i for i, r in enumerate(rule_results)
         if r["overall"] >= PRE_FILTER_THRESHOLD
@@ -702,7 +968,10 @@ def score_listings_batch(
     out: list[ScoreResult] = list(rule_results)
     for idx, llm_res in zip(plausible_indices, llm_results):
         if llm_res is not None:
-            out[idx] = llm_res
+            # Re-apply experience penalty post-LLM so the soft penalty is
+            # enforced even when the LLM scored seniority optimistically.
+            # Idempotent — re-applying with the same JD gives the same result.
+            out[idx] = apply_experience_penalty(llm_res, listings[idx], criteria)
     return out
 
 
