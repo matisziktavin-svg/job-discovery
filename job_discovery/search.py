@@ -115,6 +115,28 @@ def _normalize_location(loc: str | None) -> str:
     return s.strip()
 
 
+# Chicago + surrounding suburbs where engineering companies cluster. The brief
+# guarantees one Chicago-metro slot every morning per the 5/29 redesign;
+# is_chicago_metro is the single source of truth (cli._select_brief_picks and
+# Mizzix's morning_brief render both consult it).
+CHICAGO_METRO_KW: frozenset[str] = frozenset({
+    "chicago", "naperville", "evanston", "schaumburg", "downers grove",
+    "aurora", "elgin", "waukegan", "joliet", "oak brook", "lisle",
+    "bolingbrook", "lombard", "arlington heights", "hoffman estates",
+    # suburbs present in scan results but missing from v1 set (6/8/26):
+    "rolling meadows", "franklin park", "bensenville", "elk grove village",
+    "skokie", "oak park", "palatine", "rosemont", "glenview", "northbrook",
+    "deerfield", "lake forest", "vernon hills", "wheeling", "mount prospect",
+    "des plaines", "addison", "villa park", "itasca", "wood dale",
+})
+
+
+def is_chicago_metro(location: str | None) -> bool:
+    """True if the location string matches any Chicago-metro keyword."""
+    loc = (location or "").lower()
+    return any(kw in loc for kw in CHICAGO_METRO_KW)
+
+
 def dedupe_key(listing: Mapping[str, Any]) -> str:
     """Normalized key for deduping the same job across boards.
 

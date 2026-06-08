@@ -83,18 +83,63 @@ def _posted_date_sort_key(posted_date: Any) -> int:
         return 0
 
 
+def _picks_sort_key(m: Match) -> tuple:
+    """Stable sort key: overall desc, posted_date desc, id asc. Used by both
+    the threshold-filtered top-N selector and the Chicago-pick chooser so
+    tie-breaking stays consistent across the two paths."""
+    return (
+        -m["score"]["overall"],
+        -_posted_date_sort_key(m.get("posted_date", "")),
+        m.get("id", ""),
+    )
+
+
 def _select_top_n(
     scored: list[Match], n: int = 5, threshold: float = 3.0,
 ) -> list[Match]:
     """Sort by overall score descending, drop anything below threshold,
-    cap at N. Ties broken by posted_date desc, then id asc for stability."""
+    cap at N. Building block for _select_brief_picks."""
     qualified = [m for m in scored if m["score"]["overall"] >= threshold]
-    qualified.sort(key=lambda m: (
-        -m["score"]["overall"],
-        -_posted_date_sort_key(m.get("posted_date", "")),
-        m.get("id", ""),
-    ))
+    qualified.sort(key=_picks_sort_key)
     return qualified[:n]
+
+
+def _select_brief_picks(
+    scored: list[Match], n_best: int = 3, threshold: float = 3.0,
+) -> list[Match]:
+    """The morning brief's surface set per the 5/29 redesign:
+
+      - 1 best-rated Chicago-metro job (BYPASSES `threshold` — guaranteed
+        whenever any Chicago candidate exists in the scored pool, even if
+        its overall is below 3.0).
+      - n_best best-rated overall jobs (subject to `threshold`), deduped
+        against the Chicago pick so we never double-count.
+
+    The Chicago pick is shallow-copied with `chicago_pick: True` set so the
+    brief renderer can mark it with 🏙️ without re-running the location
+    keyword check.
+
+    Returns up to 1 + n_best items. When no Chicago candidate exists in the
+    scored pool, returns just the top-N (the rule is "always show Chicago
+    if one exists," not "fabricate Chicago from nothing").
+    """
+    chicago_candidates = [
+        m for m in scored if search.is_chicago_metro(m.get("location", ""))
+    ]
+    if not chicago_candidates:
+        return _select_top_n(scored, n=n_best, threshold=threshold)
+
+    chicago_candidates.sort(key=_picks_sort_key)
+    chicago_pick: Match = {**chicago_candidates[0], "chicago_pick": True}
+    chicago_id = chicago_pick["id"]
+
+    # Take one extra from the top-N pool so dedupe doesn't shrink the result
+    # below n_best when Chicago's pick happens to also be a top-overall.
+    best_overall = [
+        m for m in _select_top_n(scored, n=n_best + 1, threshold=threshold)
+        if m["id"] != chicago_id
+    ][:n_best]
+    return [chicago_pick] + best_overall
 
 
 def _merge_with_carryforward(
@@ -265,7 +310,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if skipped:
         logger.warning("scan: skipped %d listing(s) due to post-scoring errors", skipped)
 
-    top = _select_top_n(scored, n=args.top_n, threshold=args.threshold)
+    top = _select_brief_picks(scored, n_best=args.top_n, threshold=args.threshold)
     merged = _merge_with_carryforward(top, today)
     state.save_matches(merged)
 
@@ -403,7 +448,10 @@ def main(argv: list[str] | None = None) -> int:
     p_scan = sub.add_parser("scan", help="run the daily pipeline")
     p_scan.add_argument("--dry-run", action="store_true",
                         help="fetch + dedupe but skip scoring + state writes")
-    p_scan.add_argument("--top-n", type=int, default=3)
+    p_scan.add_argument(
+        "--top-n", type=int, default=3,
+        help="best-overall count (default 3); the Chicago-pick adds +1",
+    )
     p_scan.add_argument("--threshold", type=float, default=3.0)
     p_scan.set_defaults(func=cmd_scan)
 

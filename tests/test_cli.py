@@ -101,6 +101,93 @@ def test_select_top_n_respects_threshold_and_cap():
     assert all(m["score"]["overall"] >= 3.0 for m in top)
 
 
+# --- _select_brief_picks --------------------------------------------------
+
+
+def _mk_match(id_, overall, location, posted="2026-05-29"):
+    return {
+        "id": id_, "location": location, "posted_date": posted,
+        "score": {"overall": overall},
+    }
+
+
+def test_brief_picks_prepends_best_chicago_and_top_overall():
+    """1 best-rated Chicago job + 3 best overall, no overlap → 4 items."""
+    scored = [
+        _mk_match("denver_a", 5.0, "Denver, CO"),
+        _mk_match("seattle_b", 4.9, "Seattle, WA"),
+        _mk_match("boulder_c", 4.8, "Boulder, CO"),
+        _mk_match("schaumburg_d", 3.2, "Schaumburg, IL"),  # best Chicago
+        _mk_match("chicago_e", 2.9, "Chicago, IL"),  # 2nd-best Chicago
+    ]
+    picks = cli._select_brief_picks(scored, n_best=3, threshold=3.0)
+    ids = [m["id"] for m in picks]
+    assert ids == ["schaumburg_d", "denver_a", "seattle_b", "boulder_c"]
+    assert picks[0]["chicago_pick"] is True
+    assert all("chicago_pick" not in m or not m.get("chicago_pick")
+               for m in picks[1:])
+
+
+def test_brief_picks_dedupes_when_chicago_is_also_top_overall():
+    """If the best Chicago is also a top-3 overall, we still return 4 unique
+    items by pulling one extra from the overall pool."""
+    scored = [
+        _mk_match("chicago_top", 5.0, "Chicago, IL"),  # best overall AND best Chicago
+        _mk_match("denver_b", 4.9, "Denver, CO"),
+        _mk_match("seattle_c", 4.8, "Seattle, WA"),
+        _mk_match("boulder_d", 4.7, "Boulder, CO"),  # would-be 4th — kept by dedupe
+    ]
+    picks = cli._select_brief_picks(scored, n_best=3, threshold=3.0)
+    ids = [m["id"] for m in picks]
+    assert ids == ["chicago_top", "denver_b", "seattle_c", "boulder_d"]
+    assert picks[0]["chicago_pick"] is True
+    # The Chicago pick must not appear twice
+    assert ids.count("chicago_top") == 1
+
+
+def test_brief_picks_surfaces_low_rated_chicago_below_threshold():
+    """Tavin's spec: 'MUST always be one job in chicago even if it is low rated.'
+    The Chicago pick bypasses the threshold; the 3 best-overall don't."""
+    scored = [
+        _mk_match("denver_a", 5.0, "Denver, CO"),
+        _mk_match("seattle_b", 4.9, "Seattle, WA"),
+        _mk_match("boulder_c", 3.5, "Boulder, CO"),
+        _mk_match("naperville_d", 1.8, "Naperville, IL"),  # below threshold, still surfaces
+        _mk_match("chicago_e", 1.5, "Chicago, IL"),  # below threshold, lower than d
+    ]
+    picks = cli._select_brief_picks(scored, n_best=3, threshold=3.0)
+    ids = [m["id"] for m in picks]
+    # Chicago pick is naperville_d (higher of the two low Chicago scores)
+    assert ids[0] == "naperville_d"
+    assert picks[0]["chicago_pick"] is True
+    # The 3 best overall are all above threshold
+    assert ids[1:] == ["denver_a", "seattle_b", "boulder_c"]
+
+
+def test_brief_picks_falls_back_to_top_n_when_no_chicago_exists():
+    """No Chicago candidate anywhere → just the top-N overall, no chicago_pick
+    flag set."""
+    scored = [
+        _mk_match("denver_a", 5.0, "Denver, CO"),
+        _mk_match("seattle_b", 4.9, "Seattle, WA"),
+        _mk_match("boulder_c", 4.8, "Boulder, CO"),
+        _mk_match("austin_d", 4.0, "Austin, TX"),
+    ]
+    picks = cli._select_brief_picks(scored, n_best=3, threshold=3.0)
+    ids = [m["id"] for m in picks]
+    assert ids == ["denver_a", "seattle_b", "boulder_c"]
+    assert not any(m.get("chicago_pick") for m in picks)
+
+
+def test_brief_picks_does_not_mutate_input():
+    """The Chicago pick is a shallow copy — the original in `scored` must not
+    grow a chicago_pick field, so re-running the picker is idempotent."""
+    original = _mk_match("chicago_e", 3.2, "Chicago, IL")
+    scored = [original, _mk_match("denver_a", 5.0, "Denver, CO")]
+    cli._select_brief_picks(scored, n_best=3, threshold=3.0)
+    assert "chicago_pick" not in original
+
+
 def test_cmd_scan_isolates_per_listing_scoring_failure(tmp_path, monkeypatch, capsys):
     """Bug C regression guard: one bad listing must not abort the whole scan.
     Pre-fix, an uncaught exception in score_listing propagated up out of
