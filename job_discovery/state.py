@@ -136,6 +136,11 @@ _CITY_RE = re.compile(r"^[A-Za-z][\w\s.&'\-]*?,\s*[A-Z]{2}$")
 # about EXCLUDING titles, not including them." Case-insensitive substring.
 _EXCLUSION_H3_PATTERNS = ("exclusion", "exclude", "skip", "avoid", "filter out")
 
+# H3 sub-sections under ## Roles whose heading matches one of these patterns
+# are filed under `roles_secondary` (scored lower in role_fit). Everything
+# else under ## Roles defaults to `roles_primary`.
+_SECONDARY_H3_PATTERNS = ("secondary", "secondary titles", "tier 2", "tier-2")
+
 
 def _criteria_path() -> Path:
     return _vault() / "projects" / "Job_Search" / "discovery" / "criteria.md"
@@ -203,6 +208,13 @@ def _is_exclusion_h3(heading: str | None) -> bool:
     return any(pat in h for pat in _EXCLUSION_H3_PATTERNS)
 
 
+def _is_secondary_h3(heading: str | None) -> bool:
+    if not heading:
+        return False
+    h = heading.lower()
+    return any(pat in h for pat in _SECONDARY_H3_PATTERNS)
+
+
 def read_criteria() -> Criteria:
     """Parse criteria.md into a structured dict.
 
@@ -223,6 +235,8 @@ def read_criteria() -> Criteria:
     path = _criteria_path()
     empty: Criteria = {
         "roles": [],
+        "roles_primary": [],
+        "roles_secondary": [],
         "locations": [],
         "title_exclusions": [],
         "salary_floor": None,
@@ -241,16 +255,24 @@ def read_criteria() -> Criteria:
     sections = _split_sections(text)
     out: Criteria = dict(empty)  # type: ignore[assignment]
 
-    # Roles: split by H3, route exclusion sub-sections separately.
-    roles: list[str] = []
+    # Roles: split by H3. Exclusion sub-sections → title_exclusions.
+    # Secondary sub-sections → roles_secondary (scored lower in role_fit).
+    # Everything else (including "High priority titles", unnamed bullets) →
+    # roles_primary. `roles` is the flat combined list for back-compat.
+    roles_primary: list[str] = []
+    roles_secondary: list[str] = []
     title_exclusions: list[str] = []
     for h3, sub_body in _split_h3_subsections(sections.get("roles", "")):
         bullets = _bullet_lines(sub_body)
         if _is_exclusion_h3(h3):
             title_exclusions.extend(bullets)
+        elif _is_secondary_h3(h3):
+            roles_secondary.extend(bullets)
         else:
-            roles.extend(bullets)
-    out["roles"] = roles
+            roles_primary.extend(bullets)
+    out["roles_primary"] = roles_primary
+    out["roles_secondary"] = roles_secondary
+    out["roles"] = roles_primary + roles_secondary
     out["title_exclusions"] = title_exclusions
 
     # Locations: collect all bullets across H3 sub-sections, then keep only

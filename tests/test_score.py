@@ -400,6 +400,97 @@ def test_apply_unverified_penalty_does_not_mutate_input():
 
 
 # -----------------------------------------------------------------------------
+# Role-fit tiering (6/3/26 — primary vs secondary, Manufacturing-Engineer cap)
+# -----------------------------------------------------------------------------
+
+
+_TIERED_CRITERIA = {
+    "roles": ["Mechanical Design Engineer", "Manufacturing Engineer"],
+    "roles_primary": ["Mechanical Design Engineer"],
+    "roles_secondary": ["Manufacturing Engineer"],
+    "locations": ["Chicago, IL"],
+    "weights": {},
+}
+
+
+def test_role_fit_primary_match_scores_5():
+    listing = {
+        "title": "Mechanical Design Engineer",
+        "company": "X", "location": "Chicago, IL",
+        "description": "Hands-on mechanical design.",
+    }
+    assert score.score_rule_based(listing, _TIERED_CRITERIA)["dims"]["role_fit"] == 5
+
+
+def test_role_fit_secondary_match_caps_at_3():
+    """Secondary titles like 'Manufacturing Engineer' must not score 5 just
+    because they substring-match `roles`. They cap at 3."""
+    listing = {
+        "title": "Manufacturing Engineer",
+        "company": "X", "location": "Cudahy, WI",
+        "description": "Aerospace components, hands-on work.",
+    }
+    assert score.score_rule_based(listing, _TIERED_CRITERIA)["dims"]["role_fit"] == 3
+
+
+def test_role_fit_manufacturing_engineer_process_role_caps_at_2():
+    """The 6/3/26 Cudahy+Delavan miss: Manufacturing Engineer whose desc is
+    CNC/process work must cap at role_fit 2 regardless of tier match — even
+    when the company serves aerospace customers."""
+    listing = {
+        "title": "Manufacturing Engineer",
+        "company": "X", "location": "Cudahy, WI",
+        "description": (
+            "Aerospace/defense/medical. Hands-on CNC programming and "
+            "fixturing on the production floor. DFM/DFA work."
+        ),
+    }
+    assert score.score_rule_based(listing, _TIERED_CRITERIA)["dims"]["role_fit"] <= 2
+
+
+def test_role_fit_falls_back_to_flat_roles_when_no_tiers():
+    """Back-compat: criteria with only `roles` (no primary/secondary) keeps
+    treating everything as primary."""
+    flat = {
+        "roles": ["Mechanical Design Engineer"],
+        "locations": ["Chicago, IL"], "weights": {},
+    }
+    listing = {
+        "title": "Mechanical Design Engineer",
+        "company": "X", "location": "Chicago, IL",
+        "description": "mech design",
+    }
+    assert score.score_rule_based(listing, flat)["dims"]["role_fit"] == 5
+
+
+def test_extract_required_years_no_space_variants():
+    """6/3/26 — the 'Manufacturing engineer (5-10yr req)' wording in
+    Mizzix's analysis had no space between number range and unit. Make
+    sure those compact forms still extract."""
+    assert score.extract_required_years(
+        "Requires 5-10yr experience in aerospace."
+    ) == (5, 10)
+    assert score.extract_required_years(
+        "Need 5+yr experience."
+    ) == (5, None)
+
+
+def test_apply_experience_penalty_hard_filters_5_to_10yr_compact():
+    """End-to-end: the exact scenario from the 6/3/26 Cudahy+Delavan miss —
+    a 5-10yr requirement against a 2yr profile MUST hard-filter to 1.0."""
+    listing = {
+        "title": "Manufacturing Engineer",
+        "company": "X", "location": "Cudahy, WI",
+        "description": "Required: 5-10 years experience in CNC manufacturing.",
+    }
+    result = score.apply_experience_penalty(
+        _mk_score_result(4.6), listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    assert result["overall"] == 1.0
+    assert "hard-filter" in result["one_line_take"].lower()
+
+
+# -----------------------------------------------------------------------------
 # Required-years extraction from JD text
 # -----------------------------------------------------------------------------
 

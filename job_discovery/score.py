@@ -99,6 +99,19 @@ _NON_TARGET_QUALIFIERS = {"sales", "sell", "support", "customer", "marketing", "
 # almost every engineering title, so it's not distinguishing.
 _GENERIC_ROLE_WORDS = {"engineer", "engineering", "design", "designer"}
 
+# Description keywords that indicate a Manufacturing/Production-Engineer
+# role is the process/CNC/floor-ops flavor rather than mechanical-design.
+# When the title says "Manufacturing Engineer" and the desc has any of
+# these, role_fit caps at 2 even if the title would otherwise hit secondary.
+# Reason: "company serves aerospace customers" ≠ "aerospace engineering
+# role" — process work on the production floor isn't Tavin's lane.
+_PROCESS_MFG_KEYWORDS = (
+    "cnc", "machinist", "machining", "fixturing", "fixture",
+    "production floor", "dfm", "dfa", "tooling", "lean manufacturing",
+    "process engineering", "manufacturing process", "shop floor",
+    "production line", "work instruction", "routing sheet",
+)
+
 
 def _kw_hit(text: str, kws: set[str]) -> bool:
     t = text.lower()
@@ -120,20 +133,48 @@ def _score_role_fit(listing: Listing, criteria: Criteria) -> int:
     if "engineer" in title and _kw_hit(title, _NON_TARGET_QUALIFIERS):
         return 1
 
-    target_roles = [r.lower() for r in criteria.get("roles", [])]
-    # Direct substring match against full target role name
-    for r in target_roles:
+    # Tiered role match. Primary direct substring → 5; secondary direct
+    # substring → 3 (per the 6/3/26 fix — "Manufacturing Engineer" was
+    # scoring 5 because all titles were flat). Fall back to the flat `roles`
+    # list as primary if criteria.md doesn't have tiering H3s.
+    primary = [r.lower() for r in criteria.get("roles_primary", []) if r]
+    secondary = [r.lower() for r in criteria.get("roles_secondary", []) if r]
+    if not primary and not secondary:
+        primary = [r.lower() for r in criteria.get("roles", []) if r]
+
+    desc = (listing.get("description") or "").lower()
+
+    # Manufacturing/Production-Engineer process-role cap. If the title hits
+    # a manufacturing/production-engineer pattern AND the desc reads as
+    # process/CNC work, cap at 2 regardless of tier match.
+    is_mfg_title = (
+        ("manufacturing engineer" in title or "production engineer" in title)
+    )
+    mfg_process_cap = is_mfg_title and _kw_hit(desc, set(_PROCESS_MFG_KEYWORDS))
+
+    for r in primary:
         if r in title:
-            return 5
+            return 2 if mfg_process_cap else 5
+    for r in secondary:
+        if r in title:
+            return 2 if mfg_process_cap else 3
+
     # Distinguishing-word match: at least one word from the role appears,
     # excluding generic words ("engineer", "design") that would over-match.
-    for r in target_roles:
+    for r in primary:
         distinguishing = [
             w for w in r.split()
             if len(w) > 4 and w not in _GENERIC_ROLE_WORDS
         ]
         if distinguishing and any(w in title for w in distinguishing):
-            return 4
+            return 2 if mfg_process_cap else 4
+    for r in secondary:
+        distinguishing = [
+            w for w in r.split()
+            if len(w) > 4 and w not in _GENERIC_ROLE_WORDS
+        ]
+        if distinguishing and any(w in title for w in distinguishing):
+            return 2 if mfg_process_cap else 3
     # Engineering-adjacent but no clear target signal
     if "engineer" in title:
         if _kw_hit(title, _COORDINATION_KW):
@@ -325,19 +366,19 @@ def apply_salary_penalty(
 # ---------------------------------------------------------------------------
 
 _YEARS_RANGE_DASH_RE = re.compile(
-    r"(\d+)\s*[-–—]\s*(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+    r"(\d+)\s*[-–—]\s*(\d+)\s*(?:years?|yrs?)\b", re.IGNORECASE,
 )
 _YEARS_RANGE_TO_RE = re.compile(
-    r"(\d+)\s+to\s+(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+    r"(\d+)\s+to\s+(\d+)\s*(?:years?|yrs?)\b", re.IGNORECASE,
 )
 _YEARS_PLUS_RE = re.compile(
     r"(\d+)\s*\+\s*(?:years?|yrs?)\b", re.IGNORECASE,
 )
 _YEARS_MIN_RE = re.compile(
-    r"(?:min(?:imum)?|at\s+least)\s+(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+    r"(?:min(?:imum)?|at\s+least)\s+(\d+)\s*(?:years?|yrs?)\b", re.IGNORECASE,
 )
 _YEARS_PLAIN_RE = re.compile(
-    r"(\d+)\s+(?:years?|yrs?)\b", re.IGNORECASE,
+    r"(\d+)\s*(?:years?|yrs?)\b", re.IGNORECASE,
 )
 # "experience"-y context words that must appear within _CONTEXT_WINDOW chars
 # of a year phrase for it to count as a years-of-experience requirement (vs
@@ -348,7 +389,7 @@ _EXPERIENCE_INDICATOR_RE = re.compile(
     r"required|preferred|seeking)\b",
     re.IGNORECASE,
 )
-_CONTEXT_WINDOW = 40
+_CONTEXT_WINDOW = 60
 
 
 # Each Tavin-domain slug → keyword list scanned against the JD text. Living
@@ -530,7 +571,9 @@ def apply_experience_penalty(
     title = (listing.get("title") or "")
     desc = (listing.get("description") or "")
     listing_text = f"{title} {desc}"
-    lo, hi = extract_required_years(desc)
+    # Scan title + description together so a years-of-experience phrase in
+    # the title ("Engineer III, 5+ yrs") isn't missed when desc is partial.
+    lo, hi = extract_required_years(listing_text)
     if lo is None:
         return score_result
 
@@ -655,6 +698,8 @@ def _assemble_system_prompt(
     """
     static = {
         "criteria": {
+            "roles_primary": criteria.get("roles_primary", []),
+            "roles_secondary": criteria.get("roles_secondary", []),
             "roles": criteria.get("roles", []),
             "title_exclusions": criteria.get("title_exclusions", []),
             "locations": criteria.get("locations", []),

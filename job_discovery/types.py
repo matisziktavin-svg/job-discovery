@@ -36,8 +36,16 @@ class ExperienceProfile(TypedDict, total=False):
 
 
 class Criteria(TypedDict):
-    """Parsed criteria.md — see `state.read_criteria`."""
+    """Parsed criteria.md — see `state.read_criteria`.
+
+    `roles` is the flat combined list (primary + secondary) — preserved for
+    back-compat. `roles_primary` and `roles_secondary` reflect the H3
+    sub-section tiering inside `## Roles`. When criteria.md has no tiering
+    H3s, primary contains everything and secondary is empty.
+    """
     roles: list[str]
+    roles_primary: list[str]
+    roles_secondary: list[str]
     locations: list[str]
     title_exclusions: list[str]
     salary_floor: int | None
@@ -111,6 +119,7 @@ class Match(TypedDict):
     decoded: NotRequired[bool]
     action_date: NotRequired[str]
     pass_reason: NotRequired[str]
+    chicago_pick: NotRequired[bool]
 
 
 class ScoredHistoryEntry(TypedDict):

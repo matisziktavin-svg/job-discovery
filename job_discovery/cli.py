@@ -215,6 +215,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
             for idx, new_result in zip(rescued, rescore_results):
                 blind_results[idx] = new_result
 
+    # Belt-and-suspenders: re-apply the experience penalty against the
+    # (possibly recovery-augmented) description for every listing. Idempotent,
+    # so re-running over already-penalized results is a no-op. Catches the
+    # case where an LLM result kept overall > threshold despite the regex
+    # finding a years phrase post-recovery.
+    blind_results = [
+        score.apply_experience_penalty(r, l, criteria)
+        for r, l in zip(blind_results, fresh)
+    ]
+
     scored: list[Match] = []
     skipped = 0
     for listing, result in zip(fresh, blind_results):
