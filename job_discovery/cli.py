@@ -229,14 +229,22 @@ def cmd_scan(args: argparse.Namespace) -> int:
         system_prompt_path=scoring_system_prompt_path,
     )
 
-    # Hybrid JD-recovery: listings with no scraped description that came
-    # back >4.0 are suspect (unknown dims, esp. seniority, defaulted high).
+    # Hybrid JD-recovery: listings with NO scraped description (or one too
+    # short to expose requirements like "5-10 years experience") that came
+    # back >4.0 are suspect — unknown dims, esp. seniority, defaulted high
+    # AND the deterministic experience-penalty regex has nothing to bite on.
     # Spend a WebFetch on each, then rescore the rescued ones in a SECOND
     # batched LLM pass. Failures get the unverified-penalty flag.
+    #
+    # The short-description trigger (6/3/26) closes the Manufacturing
+    # Engineer / Cudahy+Delavan miss: scraped desc was just long enough to
+    # bypass the empty-only check but didn't contain the "5-10 years" line,
+    # so apply_experience_penalty's regex never fired.
+    SHORT_DESC_THRESHOLD = 500
     recovery_indices: list[int] = []
     for i, (listing, result) in enumerate(zip(fresh, blind_results)):
-        if (not (listing.get("description") or "").strip()
-                and result["overall"] > 4.0):
+        desc = (listing.get("description") or "").strip()
+        if len(desc) < SHORT_DESC_THRESHOLD and result["overall"] >= 4.0:
             recovery_indices.append(i)
 
     if recovery_indices:

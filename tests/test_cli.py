@@ -526,10 +526,13 @@ def test_cmd_scan_gate_penalizes_when_fetch_fails(tmp_path, monkeypatch):
 
 
 def test_cmd_scan_gate_skips_when_description_present(tmp_path, monkeypatch):
-    """Has a description → gate never fires even if score >4."""
+    """Has a substantial description (>= SHORT_DESC_THRESHOLD chars) → gate
+    never fires even if score >4. Short descriptions intentionally trigger
+    recovery (6/3/26 fix — partial scrapes were hiding "5-10 years" lines
+    from the experience-penalty regex)."""
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
     _write_criteria(tmp_path)
-    listing = _gate_listing("u", description="Full real description here.")
+    listing = _gate_listing("u", description="Full real description here. " * 30)
     monkeypatch.setattr(
         search, "fetch_all",
         lambda criteria, results_per_board=50: ([listing], {"linkedin": "ok"}),
@@ -557,9 +560,11 @@ def test_cmd_scan_gate_skips_when_description_present(tmp_path, monkeypatch):
     assert called == []  # description present → no fetch
 
 
-def test_cmd_scan_gate_skips_when_score_not_above_4(tmp_path, monkeypatch):
-    """No description but score is exactly 4.0 (not >4.0) → gate must NOT
-    fire. Verifies the strict > boundary."""
+def test_cmd_scan_gate_fires_at_score_4_exact(tmp_path, monkeypatch):
+    """No description and score is exactly 4.0 → gate MUST fire. Pins the
+    inclusive >= 4.0 boundary; the previous strict > 4.0 boundary let 6/8/26's
+    Revolution Space / NY Power Authority / IEM all surface with empty descs
+    and 15-20yr requirements unread."""
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
     _write_criteria(tmp_path)
     listing = _gate_listing("u")
@@ -587,7 +592,7 @@ def test_cmd_scan_gate_skips_when_score_not_above_4(tmp_path, monkeypatch):
 
     rc = cli.cmd_scan(_Args(dry_run=False, top_n=5, threshold=3.0))
     assert rc == 0
-    assert called == []  # 4.0 is not > 4.0 → no fetch
+    assert called == [listing["url"]]  # 4.0 hits the inclusive gate → fetch
 
 
 def test_cmd_scan_uses_batch_path_single_call_for_many_listings(tmp_path, monkeypatch):
@@ -598,7 +603,7 @@ def test_cmd_scan_uses_batch_path_single_call_for_many_listings(tmp_path, monkey
     listings = [
         {"title": f"Mech Eng {i}", "company": f"Co{i}", "location": "Chicago, IL",
          "url": f"u{i}", "salary": "$80K-$100K", "posted_date": "2026-05-24",
-         "source": "linkedin", "description": "Hands-on aerospace design."}
+         "source": "linkedin", "description": "Hands-on aerospace design. " * 25}
         for i in range(10)
     ]
     monkeypatch.setattr(
