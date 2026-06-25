@@ -99,6 +99,48 @@ _NON_TARGET_QUALIFIERS = {"sales", "sell", "support", "customer", "marketing", "
 # almost every engineering title, so it's not distinguishing.
 _GENERIC_ROLE_WORDS = {"engineer", "engineering", "design", "designer"}
 
+# Roman-numeral level suffix in a job title — "Engineer III", "Mechanical
+# Engineer IV", "Test Engineer V". Word-boundary-anchored so it only fires
+# on a real level marker (not the "iii" inside another word).
+# Maps each level to the approximate years-of-experience floor it implies
+# in standard US engineering ladders (II ≈ 2, III ≈ 3, IV ≈ 5, V ≈ 7).
+# "I" intentionally omitted — that's entry-level and already handled by
+# the explicit "intern/entry/level i" check in _score_seniority below.
+_TITLE_LEVEL_RE = re.compile(r"\b(II|III|IV|V)\b", re.IGNORECASE)
+_LEVEL_INFERRED_YEARS: dict[str, int] = {"II": 2, "III": 3, "IV": 5, "V": 7}
+# III/IV/V on a title is treated as a hard role exclusion — these tracks
+# imply mid-senior-or-above seniority that Tavin's job search isn't
+# targeting. II stays out of the hard-exclude list (often equivalent to
+# "early mid IC, ~2 yrs", which is exactly Tavin's range).
+_HARD_EXCLUDE_LEVELS = {"III", "IV", "V"}
+
+
+def _extract_title_level(title: str) -> str | None:
+    """Return the Roman-numeral level (uppercase: 'II'/'III'/'IV'/'V')
+    found in `title`, or None if no level suffix is present.
+
+    If multiple levels appear (shouldn't happen in real titles but
+    defensive), the highest one wins, since that's the more demanding
+    signal."""
+    if not title:
+        return None
+    matches = _TITLE_LEVEL_RE.findall(title)
+    if not matches:
+        return None
+    found = {m.upper() for m in matches}
+    for level in ("V", "IV", "III", "II"):
+        if level in found:
+            return level
+    return None
+
+
+# Word-boundary regex for the "Engineer I" / "Level 1" entry-level signal.
+# Replaces the older `"i " in title` substring check, which over-matched on
+# titles containing "iii " (Engineer III) and other "i "-containing prose
+# like "Engineer in Test" — that's the 6/9/26 Blue Origin failure.
+_ENTRY_LEVEL_RE = re.compile(r"\b(?:engineer\s+i|level\s+1|level\s+i)\b", re.IGNORECASE)
+
+
 # Description keywords that indicate a Manufacturing/Production-Engineer
 # role is the process/CNC/floor-ops flavor rather than mechanical-design.
 # When the title says "Manufacturing Engineer" and the desc has any of
@@ -127,6 +169,14 @@ def _score_role_fit(listing: Listing, criteria: Criteria) -> int:
     # LLM scorer is asked to enforce in scoring_system.txt.
     title_exclusions = [t.lower() for t in criteria.get("title_exclusions", []) if t]
     if any(excl in title for excl in title_exclusions):
+        return 1
+    # Roman-numeral level suffix on the title (III/IV/V) → treat like a
+    # title exclusion. "Engineer III" implies a 3+ yr mid-track role that
+    # is above Tavin's current target — same disqualifier shape as Senior.
+    # II is allowed through (early-mid IC, ~Tavin's range); the seniority
+    # dim handles it instead.
+    title_level = _extract_title_level(listing.get("title") or "")
+    if title_level in _HARD_EXCLUDE_LEVELS:
         return 1
     # Sales/Support/Customer-Success "Engineer" titles are clearly off-target
     # even though they contain "engineer". Catch them before the word match.
@@ -203,14 +253,25 @@ def _score_skills_match(listing: Listing, criteria: Criteria) -> int:
 
 
 def _score_seniority(listing: Listing) -> int:
-    title = (listing.get("title") or "").lower()
+    raw_title = listing.get("title") or ""
+    title = raw_title.lower()
     desc = (listing.get("description") or "").lower()
-    if "intern" in title or "entry" in title or "i " in title or title.endswith(" i"):
-        return 4
+    # Check the Roman-numeral level suffix BEFORE the entry-level heuristic
+    # so "Engineer III" doesn't fall through to the entry-level branch.
+    # IV/V → 1 (well above Tavin's level), III → 2, II → 3 (early-mid IC).
+    title_level = _extract_title_level(raw_title)
+    if title_level in {"IV", "V"}:
+        return 1
+    if title_level == "III":
+        return 2
+    if title_level == "II":
+        return 3
     if "principal" in title or "staff" in title:
         return 1
     if "sr." in title or "senior" in title or "lead" in title:
         return 2
+    if "intern" in title or "entry" in title or _ENTRY_LEVEL_RE.search(raw_title):
+        return 4
     if "8+ years" in desc or "10+ years" in desc or "12+ years" in desc:
         return 2
     return 4  # mid-IC default
@@ -574,6 +635,17 @@ def apply_experience_penalty(
     # Scan title + description together so a years-of-experience phrase in
     # the title ("Engineer III, 5+ yrs") isn't missed when desc is partial.
     lo, hi = extract_required_years(listing_text)
+    # Roman-numeral level on the title (II/III/IV/V) implies a years floor
+    # even when the JD body has no explicit "N years" phrase. Promote the
+    # inferred floor when it's higher than what we extracted — this closes
+    # the 6/9/26 Blue Origin "Fluid System Engineer III" miss where the JD
+    # body had no years phrase and the title-level signal was ignored.
+    title_level = _extract_title_level(title)
+    if title_level is not None:
+        inferred = _LEVEL_INFERRED_YEARS[title_level]
+        if lo is None or inferred > lo:
+            lo = inferred
+            hi = inferred
     if lo is None:
         return score_result
 

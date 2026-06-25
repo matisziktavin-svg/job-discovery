@@ -154,6 +154,136 @@ def test_rule_score_respects_title_exclusions():
     assert result["dims"]["role_fit"] == 1
 
 
+# -----------------------------------------------------------------------------
+# Roman-numeral title level (II/III/IV/V) — regression for 6/9/26 Blue Origin
+# "Fluid System Engineer III" slipping through with overall 4.4. Two bugs
+# fused: (1) Roman-numeral level was unrecognized everywhere, (2) the old
+# substring check `"i " in title` matched "iii " and returned seniority=4.
+# -----------------------------------------------------------------------------
+
+
+def _blue_origin_listing():
+    return {
+        "title": "Fluid System Engineer III - New Glenn",
+        "company": "Blue Origin",
+        "location": "Seattle, WA",
+        "salary": "$121K-$169K",
+        "description": "Aerospace cryogenic systems work on the New Glenn vehicle.",
+    }
+
+
+def test_extract_title_level_recognizes_roman_numerals():
+    assert score._extract_title_level("Mechanical Engineer III") == "III"
+    assert score._extract_title_level("Fluid System Engineer III - New Glenn") == "III"
+    assert score._extract_title_level("Design Engineer II") == "II"
+    assert score._extract_title_level("Engineer IV - Rotating Equipment") == "IV"
+    assert score._extract_title_level("Senior Engineer V") == "V"
+
+
+def test_extract_title_level_ignores_iii_inside_words():
+    """Word-boundary anchor must not fire on prose like 'tribology' or
+    'iiiiii' (defensive against typos)."""
+    assert score._extract_title_level("Tribology Engineer") is None
+    assert score._extract_title_level("Mechanical Engineer") is None
+    assert score._extract_title_level("") is None
+
+
+def test_rule_score_engineer_iii_hard_excludes_role_fit():
+    """Bug from 6/9/26: 'Fluid System Engineer III' must score role_fit=1
+    (treated like a title exclusion). Previously hit primary-title match
+    on 'engineer' and scored 5."""
+    result = score.score_rule_based(_blue_origin_listing(), CRITERIA_AERO)
+    assert result["dims"]["role_fit"] == 1
+
+
+def test_rule_score_engineer_iii_seniority_not_four():
+    """Companion bug: the loose `'i ' in title` heuristic caused 'Engineer III'
+    to be tagged ENTRY-level (seniority=4). The Roman-numeral check must run
+    first and set seniority=2."""
+    result = score.score_rule_based(_blue_origin_listing(), CRITERIA_AERO)
+    assert result["dims"]["seniority"] == 2
+
+
+def test_rule_score_engineer_iv_seniority_one():
+    listing = {**_blue_origin_listing(), "title": "Mechanical Engineer IV"}
+    result = score.score_rule_based(listing, CRITERIA_AERO)
+    assert result["dims"]["seniority"] == 1
+
+
+def test_rule_score_engineer_ii_kept_in_play():
+    """II is early-mid IC (~Tavin's range) — should NOT hard-exclude on
+    role_fit, but seniority dim drops to 3 to reflect 'slightly above
+    entry'."""
+    listing = {**_blue_origin_listing(), "title": "Mechanical Design Engineer II"}
+    result = score.score_rule_based(listing, CRITERIA_AERO)
+    assert result["dims"]["role_fit"] >= 3  # not hard-excluded
+    assert result["dims"]["seniority"] == 3
+
+
+def test_rule_score_engineer_i_still_scores_as_entry_level():
+    """Regression guard: the new regex-anchored entry-level check must
+    still recognize 'Engineer I' as entry-level (seniority=4) — the
+    legitimate case the old `'i ' in title` heuristic was trying to
+    catch."""
+    listing = {**_blue_origin_listing(), "title": "Mechanical Engineer I"}
+    result = score.score_rule_based(listing, CRITERIA_AERO)
+    assert result["dims"]["seniority"] == 4
+
+
+def test_apply_experience_penalty_engineer_iii_no_years_in_jd():
+    """The Blue Origin JD had no explicit 'N years' phrase. The title-level
+    inference must still trigger the soft penalty (3 yrs > Tavin's 2)."""
+    listing = {
+        "title": "Fluid System Engineer III",
+        "company": "Blue Origin",
+        "description": "Aerospace cryogenic systems work, no specific years stated.",
+    }
+    pre = _mk_score_result(4.4)
+    result = score.apply_experience_penalty(
+        pre, listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    assert result["overall"] < pre["overall"]
+    assert result["dims"]["seniority"] < pre["dims"]["seniority"]
+
+
+def test_apply_experience_penalty_engineer_v_hard_filter_from_title_alone():
+    """Engineer V → inferred 7 yrs ≥ 2 + 3 buffer → hard filter to 1.0."""
+    listing = {
+        "title": "Mechanical Engineer V",
+        "company": "X",
+        "description": "Senior individual contributor role.",
+    }
+    result = score.apply_experience_penalty(
+        _mk_score_result(4.5), listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    assert result["overall"] == 1.0
+    assert "hard-filter" in result["one_line_take"].lower()
+
+
+def test_apply_experience_penalty_title_level_does_not_undercount_explicit_years():
+    """If the JD body says '5+ years' but the title says 'Engineer III' (≈3
+    yrs floor), we use the higher of the two — never undercount."""
+    listing = {
+        "title": "Mechanical Engineer III",
+        "description": "Requires 5+ years of experience.",
+    }
+    result = score.apply_experience_penalty(
+        _mk_score_result(4.5), listing, CRITERIA_WITH_EXPERIENCE,
+    )
+    # 5+ exceeds the 5-yr hard-filter threshold (years_total 2 + buffer 3)
+    assert result["overall"] == 1.0
+
+
+def test_scoring_system_prompt_mentions_roman_numerals():
+    """The LLM prompt must explicitly call out the II/III/IV/V level
+    convention so the model doesn't score 'Engineer III' as a generic
+    mid-IC role."""
+    from pathlib import Path
+    text = (Path(score.__file__).parent / "prompts" / "scoring_system.txt").read_text(encoding="utf-8")
+    assert "III" in text
+    assert "Roman" in text or "roman" in text or "II/III/IV/V" in text or "level" in text.lower()
+
+
 def test_assemble_scoring_system_prompt_includes_title_exclusions():
     """Bug A wiring: title_exclusions must reach the LLM scorer so it can
     enforce role_fit=1 for excluded titles. Post-refactor these live in
