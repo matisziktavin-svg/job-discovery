@@ -330,6 +330,25 @@ def cmd_scan(args: argparse.Namespace) -> int:
         today,
     )
 
+    # Persist the full ranked board (trimmed) for a short window so the
+    # near-misses cut by the top-N surface cap stay answerable without a
+    # re-scan. See `near-misses` command.
+    state.append_scored_recent(
+        [
+            {
+                "key": search.dedupe_key(m),
+                "title": m["title"],
+                "company": m["company"],
+                "location": m["location"],
+                "url": m["url"],
+                "score": m["score"],
+                "surfaced_date": today,
+            }
+            for m in scored
+        ],
+        today,
+    )
+
     print(json.dumps({
         "fresh_scored": len(scored),
         "top_n_surfaced": len(top),
@@ -360,6 +379,48 @@ def cmd_list_active(args: argparse.Namespace) -> int:
         take = m.get("one_line_take", "")
         if take:
             print(f"   {take}")
+    return 0
+
+
+def cmd_near_misses(args: argparse.Namespace) -> int:
+    """Show jobs that scored at/above a bar on a given scan night but were
+    NOT surfaced — the near-misses cut by the top-N surface cap. Reads the
+    trimmed `job_scored_recent.json` board; no re-scan."""
+    recent = state.load_scored_recent()
+    if not recent:
+        print("(no scored-recent data — runs accumulate from the next scan)")
+        return 0
+
+    # Default to the most recent scan night present in the store.
+    date = args.date or max(e.get("surfaced_date", "") for e in recent)
+    min_score = args.min_score
+
+    # URLs that actually surfaced (active queue + actioned history). A job in
+    # either store made the cut; everything else at/above the bar was cut.
+    surfaced_urls = {
+        m.get("url") for m in (state.load_matches() + state.load_history())
+    }
+
+    rows = [
+        e for e in recent
+        if e.get("surfaced_date") == date
+        and e.get("score", {}).get("overall", 0.0) >= min_score
+    ]
+    rows.sort(key=lambda e: -e.get("score", {}).get("overall", 0.0))
+
+    cut = [e for e in rows if e.get("url") not in surfaced_urls]
+    print(
+        f"Scan {date}: {len(rows)} job(s) scored >= {min_score}, "
+        f"{len(cut)} cut by the surface cap."
+    )
+    if not cut:
+        return 0
+    for i, e in enumerate(cut, 1):
+        sv = e.get("score", {}).get("overall", "?")
+        print(
+            f"{i}. {e['company']} — {e['title']} · {e['location']} · "
+            f"score {sv}\n   {e['url']}"
+        )
     return 0
 
 
@@ -465,6 +526,20 @@ def main(argv: list[str] | None = None) -> int:
 
     p_list = sub.add_parser("list-active", help="print job_matches.json formatted")
     p_list.set_defaults(func=cmd_list_active)
+
+    p_near = sub.add_parser(
+        "near-misses",
+        help="jobs that scored >= bar on a scan night but weren't surfaced",
+    )
+    p_near.add_argument(
+        "--date", default="",
+        help="scan date YYYY-MM-DD (default: most recent scan in the store)",
+    )
+    p_near.add_argument(
+        "--min-score", type=float, default=3.8,
+        help="score floor for a near-miss (default 3.8)",
+    )
+    p_near.set_defaults(func=cmd_near_misses)
 
     p_score = sub.add_parser("score-one", help="score a single posting")
     p_score.add_argument("url")

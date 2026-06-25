@@ -21,6 +21,7 @@ from job_discovery.types import (
     Match,
     Preferences,
     ScoredHistoryEntry,
+    ScoredRecentEntry,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,10 @@ def _history_path() -> Path:
 
 def _scored_history_path() -> Path:
     return _vault() / ".mizzix_state" / "job_scored_history.json"
+
+
+def _scored_recent_path() -> Path:
+    return _vault() / ".mizzix_state" / "job_scored_recent.json"
 
 
 def new_match_id() -> str:
@@ -119,6 +124,47 @@ def append_scored_keys(
     ]
     kept.extend({"key": k, "scored_date": today} for k in keys)
     save_scored_history(kept)
+
+
+# The full ranked board for each night, trimmed to the fields needed to
+# evaluate a near-miss (score + link). Distinct from job_matches.json (only
+# the surfaced top-N) and job_scored_history (key-only dedupe cache): this is
+# what lets "anything good get cut last night?" be a lookup instead of a
+# re-scan. Short window — near-misses go stale fast as listings get filled.
+SCORED_RECENT_RETAIN_DAYS = 7
+
+
+def load_scored_recent() -> list[ScoredRecentEntry]:
+    return _load(_scored_recent_path())  # type: ignore[return-value]
+
+
+def save_scored_recent(items: list[ScoredRecentEntry]) -> None:
+    _save(_scored_recent_path(), items)  # type: ignore[arg-type]
+
+
+def append_scored_recent(
+    entries: list[ScoredRecentEntry],
+    today: str,
+    *,
+    retain_days: int = SCORED_RECENT_RETAIN_DAYS,
+) -> None:
+    """Append today's trimmed scored entries and trim anything older than
+    retain_days (by surfaced_date). No-op on empty. Idempotent within a day:
+    re-running a scan replaces today's entries for the same dedupe keys rather
+    than duplicating them."""
+    if not entries:
+        return
+    cutoff = (dt.date.fromisoformat(today)
+              - dt.timedelta(days=retain_days)).isoformat()
+    today_keys = {e["key"] for e in entries}
+    existing = load_scored_recent()
+    kept = [
+        e for e in existing
+        if e.get("surfaced_date", "") >= cutoff
+        and not (e.get("surfaced_date") == today and e.get("key") in today_keys)
+    ]
+    kept.extend(entries)
+    save_scored_recent(kept)
 
 
 _PASS_REASON_RE = re.compile(

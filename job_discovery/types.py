@@ -127,3 +127,20 @@ class ScoredHistoryEntry(TypedDict):
     cache that prevents re-scoring the same listing across nights."""
     key: str
     scored_date: str
+
+
+class ScoredRecentEntry(TypedDict):
+    """One row in `.mizzix_state/job_scored_recent.json` — a trimmed record
+    of EVERY job scored on a given night (not just the surfaced top-N), kept
+    for a short window so "what cleared the bar but got cut?" is answerable.
+
+    Carries enough to evaluate and act on a near-miss (score + link) but
+    drops `one_line_take` (regenerable) and the action/status machinery a
+    full Match carries. `key` is the dedupe_key, used for idempotency."""
+    key: str
+    title: str
+    company: str
+    location: str
+    url: str
+    score: MatchScore
+    surfaced_date: str

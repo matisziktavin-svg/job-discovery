@@ -102,6 +102,67 @@ def test_append_scored_keys_preserves_yesterdays_same_key(tmp_path, monkeypatch)
     assert {e["scored_date"] for e in items} == {"2026-05-19", "2026-05-20"}
 
 
+def _recent_entry(key, score, date, **over):
+    e = {
+        "key": key,
+        "title": "Mech Eng",
+        "company": "Acme",
+        "location": "Chicago, IL",
+        "url": f"https://x/{key}",
+        "score": {"overall": score, "dims": {}, "method": "llm"},
+        "surfaced_date": date,
+    }
+    e.update(over)
+    return e
+
+
+def test_load_scored_recent_empty_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    assert state.load_scored_recent() == []
+
+
+def test_append_scored_recent_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_recent([_recent_entry("a|b|c", 4.1, "2026-05-20")], "2026-05-20")
+    items = state.load_scored_recent()
+    assert len(items) == 1
+    assert items[0]["score"]["overall"] == 4.1
+
+
+def test_append_scored_recent_noop_on_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_recent([], "2026-05-20")
+    assert not (tmp_path / ".mizzix_state" / "job_scored_recent.json").exists()
+
+
+def test_append_scored_recent_trims_older_than_retain_days(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.save_scored_recent([
+        _recent_entry("old|j|l", 4.0, "2026-05-10"),    # >7 days before 5/20
+        _recent_entry("recent|j|l", 4.0, "2026-05-15"),  # within window
+    ])
+    state.append_scored_recent([_recent_entry("new|j|l", 4.0, "2026-05-20")], "2026-05-20")
+    keys = {e["key"] for e in state.load_scored_recent()}
+    assert keys == {"recent|j|l", "new|j|l"}
+
+
+def test_append_scored_recent_idempotent_within_a_day(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_recent([_recent_entry("a|b|c", 4.1, "2026-05-20")], "2026-05-20")
+    state.append_scored_recent([_recent_entry("a|b|c", 4.4, "2026-05-20")], "2026-05-20")
+    items = state.load_scored_recent()
+    assert len(items) == 1
+    assert items[0]["score"]["overall"] == 4.4  # re-scan replaces, not duplicates
+
+
+def test_append_scored_recent_preserves_yesterdays_same_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    state.append_scored_recent([_recent_entry("a|b|c", 4.1, "2026-05-19")], "2026-05-19")
+    state.append_scored_recent([_recent_entry("a|b|c", 4.1, "2026-05-20")], "2026-05-20")
+    items = state.load_scored_recent()
+    assert {e["surfaced_date"] for e in items} == {"2026-05-19", "2026-05-20"}
+
+
 CRITERIA_FIXTURE = """\
 # Job Search Criteria
 
