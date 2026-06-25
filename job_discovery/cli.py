@@ -518,8 +518,8 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--dry-run", action="store_true",
                         help="fetch + dedupe but skip scoring + state writes")
     p_scan.add_argument(
-        "--top-n", type=int, default=3,
-        help="best-overall count (default 3); the Chicago-pick adds +1",
+        "--top-n", type=int, default=4,
+        help="best-overall count (default 4); the Chicago-pick adds +1",
     )
     p_scan.add_argument("--threshold", type=float, default=3.0)
     p_scan.set_defaults(func=cmd_scan)
