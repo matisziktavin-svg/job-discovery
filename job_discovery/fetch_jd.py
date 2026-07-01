@@ -8,19 +8,23 @@ Public API:
 Recovery is staged:
   Tier 1 — WebFetch via the Claude Agent SDK (Haiku). Fast and free when it
     works; defeated by JS-rendered SPAs (Workday, Greenhouse, Lever, iCIMS).
-  Tier 2 — Playwright headless Chromium render → grab body innerText. Cracks
-    SPAs that tier 1 can't see. No extra LLM call: the downstream batched
-    rescore already does extraction-via-LLM against the recovered text.
+  Tier 2 — Firecrawl scrape → clean Markdown. Firecrawl renders JS and defeats
+    the bot protection that stops both WebFetch and a plain headless browser
+    (LinkedIn is still a coin-flip, but Workday/Greenhouse/Lever/iCIMS crack).
+    No extra LLM call: the downstream batched rescore already does
+    extraction-via-LLM against the recovered text.
 
 Tier 1 internals mirror score.score_llm's Claude Agent SDK setup (OAuth-forced,
 file-based system prompt, bypassPermissions). The wrapping agent only calls
 WebFetch and relays text, so it runs on Haiku — the extraction intelligence
 lives in WebFetch's own model, not here.
 
-Tier 2 requires `playwright` and its Chromium install:
-    pip install playwright && playwright install chromium
-If Playwright is not importable, tier 2 is silently skipped (logged once per
-process) and fetch behaves as tier-1-only.
+Tier 2 requires the `firecrawl-py` SDK and a Firecrawl API key:
+    pip install firecrawl-py            # (declared in pyproject deps)
+    export FIRECRAWL_API_KEY=fc-...     # free tier: ~1000 scrapes/month
+Firecrawl only runs when Tier 1 (free WebFetch) fails, so a normal scan burns
+few credits. If the SDK isn't importable or the key is unset, tier 2 is
+silently skipped (logged once per process) and fetch behaves as tier-1-only.
 """
 import asyncio
 import logging
@@ -34,13 +38,14 @@ logger = logging.getLogger(__name__)
 # prompt in prompts/fetch_jd_system.txt.
 _NO_DESC_SENTINEL = "NO_DESCRIPTION_AVAILABLE"
 
-# Tier 2 (Playwright) trim and floor.
+# Tier 2 (Firecrawl) trim and floor.
 _TIER2_MAX_CHARS = 30_000
 _TIER2_MIN_CHARS = 200
 
-# Whether we've already warned about Playwright being unavailable. Avoids
-# spamming the log once per recovery attempt — one line per process is enough.
-_playwright_unavailable_warned = False
+# Whether we've already warned about Firecrawl being unavailable (SDK missing
+# or API key unset). Avoids spamming the log once per recovery attempt — one
+# line per process is enough.
+_firecrawl_unavailable_warned = False
 
 
 def _interpret_fetch_output(raw: str | None) -> str | None:
@@ -104,59 +109,70 @@ async def _run_fetch_agent(url: str, timeout_s: float) -> str:
     return await asyncio.wait_for(_drive(), timeout=timeout_s)
 
 
-def _fetch_via_playwright(url: str, timeout_s: float) -> str | None:
-    """Tier 2: render with headless Chromium, return body innerText or None.
+def _extract_markdown(result: object) -> str | None:
+    """Pull the markdown string out of a Firecrawl scrape result.
+
+    firecrawl-py has returned both a dict (`{"markdown": ...}`) and a
+    Document-style object (`result.markdown`) across versions, so accept
+    either. Returns None if no markdown field is present.
+    """
+    if result is None:
+        return None
+    md = getattr(result, "markdown", None)
+    if md is None and isinstance(result, dict):
+        md = result.get("markdown")
+    return md if isinstance(md, str) else None
+
+
+def _fetch_via_firecrawl(url: str, timeout_s: float) -> str | None:
+    """Tier 2: scrape with Firecrawl, return clean Markdown or None.
 
     Never raises. Returns None when:
-      - Playwright (or its browser) isn't installed.
-      - Navigation, render, or extraction errors out.
+      - firecrawl-py isn't installed or FIRECRAWL_API_KEY is unset.
+      - The scrape errors out (timeout, HTTP error, blocked page).
       - The recovered text is too short to be a real JD (<_TIER2_MIN_CHARS).
 
     Output is trimmed to _TIER2_MAX_CHARS to keep the downstream LLM rescore
     cheap; nav/footer noise is left in — the scorer handles it.
     """
-    global _playwright_unavailable_warned
+    global _firecrawl_unavailable_warned
+    api_key = os.environ.get("FIRECRAWL_API_KEY")
     try:
-        from playwright.sync_api import sync_playwright  # type: ignore
+        from firecrawl import Firecrawl  # type: ignore
     except ImportError:
-        if not _playwright_unavailable_warned:
+        if not _firecrawl_unavailable_warned:
             logger.info(
-                "fetch_job_description: tier 2 skipped — playwright not installed"
+                "fetch_job_description: tier 2 skipped — firecrawl-py not installed"
             )
-            _playwright_unavailable_warned = True
+            _firecrawl_unavailable_warned = True
+        return None
+    if not api_key:
+        if not _firecrawl_unavailable_warned:
+            logger.info(
+                "fetch_job_description: tier 2 skipped — FIRECRAWL_API_KEY unset"
+            )
+            _firecrawl_unavailable_warned = True
         return None
 
-    timeout_ms = int(timeout_s * 1000)
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    )
-                )
-                page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                # Best-effort networkidle wait — SPAs need it to finish XHRs,
-                # but plenty of pages never reach idle. Treat the timeout as
-                # "good enough, take what's rendered".
-                try:
-                    page.wait_for_load_state("networkidle", timeout=8000)
-                except Exception:
-                    pass
-                text = page.inner_text("body")
-            finally:
-                browser.close()
+        client = Firecrawl(api_key=api_key)
+        # Firecrawl's timeout is milliseconds; give it the same budget the
+        # caller allotted this tier. onlyMainContent trims nav/footer server
+        # side so we spend fewer of the _TIER2_MAX_CHARS on chrome.
+        result = client.scrape(
+            url,
+            formats=["markdown"],
+            only_main_content=True,
+            timeout=int(timeout_s * 1000),
+        )
     except Exception:
         logger.warning(
-            "fetch_job_description: tier 2 playwright failed for %s",
+            "fetch_job_description: tier 2 firecrawl failed for %s",
             url, exc_info=True,
         )
         return None
 
+    text = _extract_markdown(result)
     if not text:
         return None
     text = text.strip()
@@ -171,10 +187,11 @@ def fetch_job_description(url: str, timeout_s: float = 45.0) -> str | None:
     """Recover a job description. None on any failure.
 
     Tries tier 1 (WebFetch via SDK) first; on None, falls back to tier 2
-    (Playwright render). Forces the Claude Max OAuth path (pops
+    (Firecrawl scrape). Forces the Claude Max OAuth path (pops
     ANTHROPIC_API_KEY) so the SDK fetch bills the subscription, not a stray
-    key — same rule as score.score_llm. Never raises: every failure path
-    collapses to None.
+    key — same rule as score.score_llm. (Firecrawl bills its own
+    FIRECRAWL_API_KEY, unrelated to Anthropic.) Never raises: every failure
+    path collapses to None.
     """
     os.environ.pop("ANTHROPIC_API_KEY", None)
     try:
@@ -188,8 +205,8 @@ def fetch_job_description(url: str, timeout_s: float = 45.0) -> str | None:
     text = _interpret_fetch_output(raw)
     if text:
         return text
-    # Tier 1 came back empty / sentinel / errored — try the browser render.
+    # Tier 1 came back empty / sentinel / errored — pay for a Firecrawl scrape.
     # Cap tier 2 at a tighter timeout: by the time we get here, total time
     # spent on the listing is already meaningful and we don't want one stuck
-    # render to blow the scan budget.
-    return _fetch_via_playwright(url, timeout_s=min(timeout_s, 25.0))
+    # scrape to blow the scan budget.
+    return _fetch_via_firecrawl(url, timeout_s=min(timeout_s, 25.0))

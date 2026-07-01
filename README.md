@@ -8,14 +8,13 @@ See [DESIGN.md](DESIGN.md) for the full design.
 
     pip install -e ".[dev]"
 
-### Optional: tier-2 JD recovery (Playwright)
+### Tier-2 JD recovery (Firecrawl)
 
-Tier 1 recovery uses WebFetch. For JS-rendered SPAs (Workday, Greenhouse, Lever, LinkedIn), tier 2 falls back to a headless Chromium render — install it once:
+Tier 1 recovery uses WebFetch (free). For JS-rendered SPAs (Workday, Greenhouse, Lever, iCIMS) and bot-protected pages, tier 2 falls back to a [Firecrawl](https://www.firecrawl.dev) scrape. `firecrawl-py` is a core dependency, so no extra install — just set an API key (free tier ~1000 scrapes/month):
 
-    pip install -e ".[browser]"
-    playwright install chromium
+    export FIRECRAWL_API_KEY=fc-...
 
-If not installed, tier 2 is silently skipped and recovery behaves as tier-1-only.
+Firecrawl only runs when tier 1 fails, so a normal scan burns few credits. If the key is unset, tier 2 is silently skipped and recovery behaves as tier-1-only.
 
 ## Run tests
 
